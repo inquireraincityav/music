@@ -1,0 +1,5 @@
+yt-dlp>=2024.10.7
+spotdl>=4.2.5
+mutagen>=1.47.0
+requests>=2.31.0
+python-telegram-bot>=21.0

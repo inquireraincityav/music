@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "musicdl"
+version = "0.1.0"
+description = "Local CLI to fetch songs/playlists/DJ-set tracklists as 320 kbps MP3."
+requires-python = ">=3.9"
+dependencies = [
+    "yt-dlp>=2024.10.7",
+    "spotdl>=4.2.5",
+    "mutagen>=1.47.0",
+    "requests>=2.31.0",
+    "python-telegram-bot>=21.0",
+]
+
+[project.scripts]
+musicdl = "musicdl.cli:main"
+musicdl-bot = "musicdl.bot:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["musicdl*"]
