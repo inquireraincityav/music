@@ -31,11 +31,13 @@ import subprocess
 import sys
 import time
 from functools import wraps
+from html import escape as html_escape
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
+from urllib.parse import quote_plus
 
 from telegram import Update
-from telegram.constants import ChatAction
+from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -301,13 +303,113 @@ async def _handle_url(update, url: str, variant: str | None, force_full: bool = 
     await _download_as_full_video(update, url)
 
 
+def _search_url(service: str, query: str) -> str:
+    q = quote_plus(query)
+    return {
+        "youtube": f"https://www.youtube.com/results?search_query={q}",
+        "soundcloud": f"https://soundcloud.com/search/sounds?q={q}",
+        "beatport": f"https://www.beatport.com/search?q={q}",
+        "1001tl": f"https://www.1001tracklists.com/search?q={q}",
+    }[service]
+
+
+def _explain_failure(msg: str) -> tuple[str, str]:
+    """Return (short_reason, follow_up_hint) for a track download error."""
+    m = msg.lower()
+    if "no search results" in m:
+        return (
+            "No YouTube matches.",
+            "Try SoundCloud/Beatport, or fix the spelling of artist/title.",
+        )
+    if "no result under" in m and "min for" in m:
+        return (
+            "All top matches were long DJ sets/mixes — track probably doesn't exist as a standalone.",
+            "If it's a bootleg/mashup, break it into source tracks. Otherwise "
+            "SoundCloud is where DJs post bootlegs; Beatport carries official releases.",
+        )
+    if "audio extraction produced no" in m or "extraction produced no" in m:
+        return (
+            "Top result had no extractable audio — likely age-restricted, DRM, or image-only.",
+            "Try SoundCloud/Beatport, or append --variant \"<channel or version>\" "
+            "to pick a different upload.",
+        )
+    if "hit has no url" in m:
+        return (
+            "Search returned a result without a usable URL.",
+            "Retry, or add --variant to steer the search.",
+        )
+    short = msg.split("\n")[0][:180]
+    return (short, "Try SoundCloud/Beatport, or paste a direct URL for this track.")
+
+
+def _chunk_by_lines(text: str, limit: int = 3800) -> list[str]:
+    """Split text into chunks under `limit` chars without breaking lines."""
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for line in text.split("\n"):
+        add = len(line) + 1
+        if current and current_len + add > limit:
+            chunks.append("\n".join(current))
+            current = [line]
+            current_len = add
+        else:
+            current.append(line)
+            current_len += add
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
+async def _send_failure_report(update: Update, failed: list[tuple[Any, str]]) -> None:
+    """Send a detailed per-track failure explanation with search links."""
+    if not failed:
+        return
+    lines = [f"<b>{len(failed)} track(s) failed. Details:</b>", ""]
+    for entry, err in failed:
+        query = entry.query
+        reason, hint = _explain_failure(err)
+        yt = _search_url("youtube", query)
+        sc = _search_url("soundcloud", query)
+        bp = _search_url("beatport", query)
+        tl = _search_url("1001tl", query)
+        lines.append(f"<b>{entry.index}. {html_escape(query)}</b>")
+        lines.append(f"  ↳ {html_escape(reason)}")
+        if hint:
+            lines.append(f"  ↳ {html_escape(hint)}")
+        lines.append(
+            f'  ↳ Search: <a href="{yt}">YouTube</a> · '
+            f'<a href="{sc}">SoundCloud</a> · '
+            f'<a href="{bp}">Beatport</a> · '
+            f'<a href="{tl}">1001tracklists</a>'
+        )
+        lines.append("")
+    chat = update.effective_chat
+    if not chat:
+        return
+    for chunk in _chunk_by_lines("\n".join(lines)):
+        try:
+            await chat.send_message(
+                chunk,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            log.warning("failure report send failed, falling back to plain: %s", e)
+            await chat.send_message(chunk[:3800])
+
+
 async def _download_tracks_with_progress(
     update: Update,
     tracks: list,
     out_dir: Path,
     label: str,
 ) -> None:
-    """Download each track via search; edit a single status message as it goes."""
+    """Download each track via search; edit a single status message as it goes.
+
+    On completion, sends a separate detailed failure report with per-track
+    explanations and clickable search links if any tracks failed.
+    """
     chat = update.effective_chat
     n = len(tracks)
     status = await chat.send_message(
@@ -315,7 +417,7 @@ async def _download_tracks_with_progress(
     )
     last_edit = 0.0
     ok = 0
-    failed: list[str] = []
+    failed: list[tuple[Any, str]] = []
 
     async def edit(text: str, force: bool = False) -> None:
         nonlocal last_edit
@@ -331,7 +433,7 @@ async def _download_tracks_with_progress(
     for i, entry in enumerate(tracks, 1):
         await edit(
             f"{label}: {i - 1}/{n}"
-            + (f" (failed {len(failed)})" if failed else "")
+            + (f" · {len(failed)} failed" if failed else "")
             + f"\nNow: {entry.query}"
         )
         try:
@@ -346,14 +448,13 @@ async def _download_tracks_with_progress(
             )
             ok += 1
         except Exception as e:
-            failed.append(f"[{entry.index}] {entry.query}: {e}")
+            failed.append((entry, str(e)))
 
     final = f"{label}: {ok}/{n} done"
     if failed:
-        preview = "\n".join(failed[:10])
-        more = f"\n… and {len(failed) - 10} more" if len(failed) > 10 else ""
-        final += f"\nFailed ({len(failed)}):\n{preview}{more}"
+        final += f" · {len(failed)} failed (details below)"
     await edit(final, force=True)
+    await _send_failure_report(update, failed)
 
 
 async def _handle_set(update, url: str) -> None:
