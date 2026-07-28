@@ -95,6 +95,39 @@ def restricted(handler: Callable) -> Callable:
     return wrapper
 
 
+_NUMBERED_TRACK = re.compile(r"\s(?=\d{1,3}\s*[\.\)]\s+)")
+
+
+def _split_tracklist_payload(payload: str) -> tuple[str, str]:
+    """Return (set_name, tracks_body) from a !tracklist message body.
+
+    Accepts either:
+      - Multi-line: first line is set name, remaining lines are tracks.
+      - One line with numbered tracks: 'Ibiza Set 1. A - B 2. C - D 3. E - F'
+        The prefix before the first '1.' becomes the set name.
+    """
+    lines = [ln.strip() for ln in payload.splitlines() if ln.strip()]
+    if len(lines) > 1:
+        return lines[0], "\n".join(lines[1:])
+
+    single = lines[0] if lines else ""
+    if not single:
+        return "", ""
+
+    # Split before " N. " tokens. First segment is the set name.
+    parts = _NUMBERED_TRACK.split(single)
+    if len(parts) >= 2:
+        set_name = parts[0].strip()
+        # Strip the leading "N." from each track segment.
+        tracks = [
+            re.sub(r"^\d{1,3}\s*[\.\)]\s+", "", p).strip() for p in parts[1:]
+        ]
+        return set_name, "\n".join(t for t in tracks if t)
+
+    # No numbered pattern — nothing usable.
+    return "", ""
+
+
 def _extract_variant(text: str) -> tuple[str, str | None]:
     """Pull --variant "..." out of message text; return (remaining, variant)."""
     m = re.search(r'--variant\s+(?:"([^"]+)"|(\S+))', text)
@@ -360,16 +393,19 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if text.lower().startswith("!tracklist"):
             payload = text[10:].strip()
-            lines = [ln for ln in payload.splitlines() if ln.strip()]
-            if len(lines) < 2:
+            set_name, body = _split_tracklist_payload(payload)
+            if not set_name or not body:
                 await _reply(
                     update,
-                    "!tracklist expects a set name on the first line and one "
-                    "track per line after it.",
+                    "!tracklist expects a set name and at least one track.\n\n"
+                    "Multi-line form:\n"
+                    "!tracklist Ibiza Set\n"
+                    "Artist - Title\n"
+                    "Artist - Title\n\n"
+                    "One-line form (numbered):\n"
+                    "!tracklist Ibiza Set 1. Artist - Title 2. Artist - Title",
                 )
                 return
-            set_name = lines[0].strip()
-            body = "\n".join(lines[1:])
             await _handle_tracklist_text(update, set_name, body)
             return
 
