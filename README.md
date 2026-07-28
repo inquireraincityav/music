@@ -97,6 +97,34 @@ musicdl --tracklist-file mySet.txt --name "Solomun @ Diynamic 2024"
 
 Each line can be `HH:MM Artist - Title` or just `Artist - Title`.
 
+## DJ-set tracklist discovery
+
+When you use `!set <url>`, `musicdl` tries to find a tracklist in this order:
+
+1. **Video description**, looking for timestamped `01:23 Artist - Title` lines.
+2. **Top-level YouTube comments** (fallback if description has no timestamps).
+3. **1001tracklists.com** — first checks the description for a
+   `1001tracklists.com/...` URL (many DJs link theirs), then does a
+   DuckDuckGo web search for `"<video title>" 1001tracklists`.
+4. Fetches the discovered page — first via plain `requests` with a browser
+   User-Agent, and if Cloudflare's challenge page comes back, retries via
+   Playwright (headless Chromium). Playwright is *optional*: skip its install
+   and the bot degrades to requests-only, catching the Cloudflare-blocked
+   cases via the paste-manually fallback.
+
+If everything fails, the bot replies with the URL it found (if any) and asks
+you to open it in a browser and paste the tracklist back with `!tracklist`.
+
+### Enabling the Playwright fallback
+
+```bash
+pip install '.[browser]'          # or: pip install playwright
+playwright install chromium       # ~200MB download, one-time
+```
+
+After that, restart `musicdl-bot`. The web-discovery path will start using
+the headless browser when Cloudflare blocks a plain fetch.
+
 ## Telegram bot (chat from your phone)
 
 `musicdl-bot` lets you drive everything above from a Telegram chat.

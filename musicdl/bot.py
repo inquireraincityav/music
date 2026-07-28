@@ -55,6 +55,7 @@ from .downloader import (
 from .organizer import playlist_dir, set_dir, single_dir
 from .spotify import download_spotify
 from .tracklist import parse_tracklist_from_info
+from .tracklist_web import discover_tracklist_from_web
 
 log = logging.getLogger("musicdl.bot")
 
@@ -315,18 +316,32 @@ async def _handle_set(update, url: str) -> None:
     await _reply(update, f"Parsing DJ set: {url}")
     info = await _run_in_thread(get_video_metadata, url)
     tracks = parse_tracklist_from_info(info)
+    web_source: str | None = None
     if not tracks:
-        await _reply(
-            update,
-            "No tracklist found in description/comments.\n\n"
-            "Send it manually with:\n"
-            "!tracklist Set Name\n"
-            "Artist - Title\n"
-            "Artist - Title\n"
-            "...\n\n"
-            "(Timestamps like `01:23 Artist - Title` also work.)",
-        )
-        return
+        await _reply(update, "Description had no tracklist — searching the web…")
+        discovery = await _run_in_thread(discover_tracklist_from_web, info)
+        tracks = discovery.tracks
+        web_source = discovery.source_url
+        if tracks:
+            await _reply(
+                update,
+                f"Found {len(tracks)} tracks via {web_source}",
+            )
+        else:
+            trail = "\n  ".join(discovery.notes) if discovery.notes else "no attempts logged"
+            source_line = f"\n\nSaw this URL but couldn't parse it: {web_source}" if web_source else ""
+            await _reply(
+                update,
+                "No tracklist found automatically.\n\nWhat I tried:\n  "
+                f"{trail}{source_line}\n\n"
+                "Paste it manually with:\n"
+                "!tracklist Set Name\n"
+                "Artist - Title\n"
+                "Artist - Title\n"
+                "...\n\n"
+                "(Timestamps like `01:23 Artist - Title` also work.)",
+            )
+            return
     name = info.get("title") or "set"
     out = set_dir(name, output)
     await _download_tracks_with_progress(update, tracks, out, label=name)
