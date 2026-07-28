@@ -156,6 +156,7 @@ WantedBy=default.target
 | `!set https://…` | DJ set — parse its tracklist and download each track. |
 | `!playlist https://…` | Force playlist mode. |
 | `!search Artist - Title` | Free-text search. |
+| `!tracklist <name>` (multiline body) | Download each line as a track. Use when `!set` can't find a tracklist in the video. First line is the set name, following lines are `Artist - Title` (timestamped lines also OK). |
 | `… --variant "Extended Mix"` | Steer to the right remix/edit version. |
 | `/git pull` | Pull latest code from the repo. |
 | `/shell <cmd>` | Run a shell command *(only if `MUSICDL_SHELL_ENABLED=1`)*. |

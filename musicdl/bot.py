@@ -127,6 +127,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Prefix with !set for a DJ set (parses tracklist).\n"
         "Prefix with !playlist to force playlist mode.\n"
         "Use !search <query> for free-text lookup.\n"
+        "Use !tracklist <name>\\n<lines> to download a pasted tracklist.\n"
         "Append --variant \"Extended Mix\" to steer the version.\n\n"
         "Commands: /whoami /git pull /restart"
         + (" /shell" if SHELL_ENABLED else ""),
@@ -228,8 +229,13 @@ async def _handle_set(update, url: str) -> None:
     if not tracks:
         await _reply(
             update,
-            "No tracklist found in description/comments. "
-            "Send me a plain-text tracklist and I'll download each line.",
+            "No tracklist found in description/comments.\n\n"
+            "Send it manually with:\n"
+            "!tracklist Set Name\n"
+            "Artist - Title\n"
+            "Artist - Title\n"
+            "...\n\n"
+            "(Timestamps like `01:23 Artist - Title` also work.)",
         )
         return
     name = info.get("title") or "set"
@@ -260,6 +266,51 @@ async def _handle_playlist(update, url: str) -> None:
     await _reply(update, f"Playlist {name!r}: {len(entries)} entries -> {out}")
     results = await _run_in_thread(download_playlist_entries, entries, out)
     await _reply(update, f"Downloaded {len(results)} tracks.")
+
+
+async def _handle_tracklist_text(update, name: str, text: str) -> None:
+    """Download each track from a pasted tracklist (timestamped or plain lines)."""
+    from .tracklist import parse_tracklist, TracklistEntry, _split_artist_title
+
+    tracks = parse_tracklist(text)
+    if not tracks:
+        # Fallback: treat each non-empty line as "Artist - Title".
+        tracks = []
+        for i, line in enumerate(
+            (ln.strip() for ln in text.splitlines() if ln.strip()), 1
+        ):
+            artist, title = _split_artist_title(line)
+            tracks.append(
+                TracklistEntry(
+                    index=i,
+                    timestamp="00:00",
+                    seconds=0,
+                    text=line,
+                    artist=artist,
+                    title=title,
+                )
+            )
+    if not tracks:
+        await _reply(update, "No tracks recognized in that message.")
+        return
+    out = set_dir(name, None)
+    await _reply(update, f"{len(tracks)} tracks -> {out}")
+    failed: list[str] = []
+    for entry in tracks:
+        try:
+            await _run_in_thread(
+                download_search,
+                entry.title,
+                entry.artist,
+                None,
+                dest_dir=out,
+                playlist_index=entry.index,
+                filename_hint=entry.query,
+            )
+        except Exception as e:
+            failed.append(f"[{entry.index}] {entry.query}: {e}")
+    tail = f"\nFailed: {len(failed)}\n" + "\n".join(failed) if failed else ""
+    await _reply(update, f"Done.{tail}")
 
 
 async def _handle_search(update, query: str, variant: str | None) -> None:
@@ -305,6 +356,21 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await _reply(update, "!playlist expects a URL.")
                 return
             await _handle_playlist(update, m.group(0))
+            return
+
+        if text.lower().startswith("!tracklist"):
+            payload = text[10:].strip()
+            lines = [ln for ln in payload.splitlines() if ln.strip()]
+            if len(lines) < 2:
+                await _reply(
+                    update,
+                    "!tracklist expects a set name on the first line and one "
+                    "track per line after it.",
+                )
+                return
+            set_name = lines[0].strip()
+            body = "\n".join(lines[1:])
+            await _handle_tracklist_text(update, set_name, body)
             return
 
         if text.lower().startswith("!search"):
