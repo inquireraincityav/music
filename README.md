@@ -180,8 +180,9 @@ WantedBy=default.target
 
 | Message | Effect |
 | --- | --- |
-| `https://…` | Download that URL (auto-detects playlist). |
-| `!set https://…` | DJ set — parse its tracklist and download each track. |
+| `https://…` | Download that URL. If it's a playlist, expands and downloads each. If it's a long video (>20 min), treated as a DJ set: auto-parses tracklist and downloads each track, falling back to the whole video as one MP3 if no tracklist is found. Otherwise a single track. |
+| `!set https://…` | Force set mode. Refuses to fall back to a full-video download; asks you to paste manually if no tracklist is found. |
+| `!full https://…` | Skip tracklist parsing and grab the whole video as one MP3. |
 | `!playlist https://…` | Force playlist mode. |
 | `!search Artist - Title` | Free-text search. |
 | `!tracklist <name>` (multiline body) | Download each line as a track. Use when `!set` can't find a tracklist in the video. First line is the set name, following lines are `Artist - Title` (timestamped lines also OK). |

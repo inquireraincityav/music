@@ -63,6 +63,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 URL_RE = re.compile(r"https?://\S+")
 
+# Any video at least this long is treated as a probable DJ set / mix / show,
+# and we try to parse its tracklist automatically before downloading.
+_LONG_VIDEO_THRESHOLD_SEC = 20 * 60
+
 
 def _parse_allowlist(raw: str | None) -> set[int]:
     if not raw:
@@ -158,12 +162,19 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reply(
         update,
         "musicdl bot ready.\n\n"
-        "Send a URL to download it as 320 kbps MP3.\n"
-        "Prefix with !set for a DJ set (parses tracklist).\n"
-        "Prefix with !playlist to force playlist mode.\n"
-        "Use !search <query> for free-text lookup.\n"
-        "Use !tracklist <name>\\n<lines> to download a pasted tracklist.\n"
-        "Append --variant \"Extended Mix\" to steer the version.\n\n"
+        "Just send a URL — I'll figure out what to do:\n"
+        "  • Track     → download as 320 kbps MP3\n"
+        "  • Playlist  → download each track in order\n"
+        "  • Long video (>20 min) → treated as a DJ set: auto-parse tracklist "
+        "(description → 1001tracklists) and download each track; falls back to "
+        "the full video if no tracklist is found.\n\n"
+        "Explicit prefixes (only needed to override the automatic behavior):\n"
+        "  !set <url>       — force set-parse mode (never falls back to full video)\n"
+        "  !full <url>      — download the whole video as one MP3, no tracklist parse\n"
+        "  !playlist <url>  — force playlist mode\n"
+        "  !search <query>  — free-text search\n"
+        "  !tracklist <name>\\n<lines>  — download a pasted tracklist\n\n"
+        "Append --variant \"Extended Mix\" to steer version selection.\n\n"
         "Commands: /whoami /git pull /restart"
         + (" /shell" if SHELL_ENABLED else ""),
     )
@@ -229,7 +240,23 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- download handlers ----------
 
 
-async def _handle_url(update, url: str, variant: str | None) -> None:
+async def _try_find_tracklist(update, info: dict):
+    """Return (tracks, source_url) — description first, then web fallback."""
+    tracks = parse_tracklist_from_info(info)
+    if tracks:
+        return tracks, None
+    await _reply(update, "Description had no tracklist — searching the web…")
+    discovery = await _run_in_thread(discover_tracklist_from_web, info)
+    return discovery.tracks, discovery.source_url
+
+
+async def _download_as_full_video(update, url: str) -> None:
+    out = single_dir(None)
+    result = await _run_in_thread(download_url, url, out, None, None)
+    await _reply(update, f"Saved {result.filepath.name}")
+
+
+async def _handle_url(update, url: str, variant: str | None, force_full: bool = False) -> None:
     output = None  # use default root
     if is_spotify_url(url):
         out = single_dir(output) if "/track/" in url else playlist_dir("Spotify", output)
@@ -249,11 +276,29 @@ async def _handle_url(update, url: str, variant: str | None) -> None:
         await _reply(update, f"Downloaded {len(results)} tracks.")
         return
 
-    out = single_dir(output)
-    result = await _run_in_thread(
-        download_url, url, out, None, None
-    )
-    await _reply(update, f"Saved {result.filepath.name}")
+    duration = int(info.get("duration") or 0)
+    if not force_full and duration >= _LONG_VIDEO_THRESHOLD_SEC:
+        await _reply(
+            update,
+            f"Long video ({duration // 60}m) — treating as a DJ set and trying "
+            "to parse its tracklist. (Send `!full <url>` if you want the whole "
+            "thing as one MP3 instead.)",
+        )
+        tracks, source = await _try_find_tracklist(update, info)
+        if tracks:
+            if source:
+                await _reply(update, f"Found {len(tracks)} tracks via {source}")
+            name = info.get("title") or "set"
+            out = set_dir(name, output)
+            await _download_tracks_with_progress(update, tracks, out, label=name)
+            return
+        await _reply(
+            update,
+            "No tracklist found automatically — downloading the full video as "
+            "one MP3 instead.",
+        )
+
+    await _download_as_full_video(update, url)
 
 
 async def _download_tracks_with_progress(
@@ -312,36 +357,31 @@ async def _download_tracks_with_progress(
 
 
 async def _handle_set(update, url: str) -> None:
+    """Explicit !set — refuse to fall back to a full-video download.
+
+    Reports what was tried when nothing works so the user can paste
+    a tracklist manually with !tracklist.
+    """
     output = None
     await _reply(update, f"Parsing DJ set: {url}")
     info = await _run_in_thread(get_video_metadata, url)
-    tracks = parse_tracklist_from_info(info)
-    web_source: str | None = None
+    tracks, source = await _try_find_tracklist(update, info)
     if not tracks:
-        await _reply(update, "Description had no tracklist — searching the web…")
-        discovery = await _run_in_thread(discover_tracklist_from_web, info)
-        tracks = discovery.tracks
-        web_source = discovery.source_url
-        if tracks:
-            await _reply(
-                update,
-                f"Found {len(tracks)} tracks via {web_source}",
-            )
-        else:
-            trail = "\n  ".join(discovery.notes) if discovery.notes else "no attempts logged"
-            source_line = f"\n\nSaw this URL but couldn't parse it: {web_source}" if web_source else ""
-            await _reply(
-                update,
-                "No tracklist found automatically.\n\nWhat I tried:\n  "
-                f"{trail}{source_line}\n\n"
-                "Paste it manually with:\n"
-                "!tracklist Set Name\n"
-                "Artist - Title\n"
-                "Artist - Title\n"
-                "...\n\n"
-                "(Timestamps like `01:23 Artist - Title` also work.)",
-            )
-            return
+        source_line = f"\n\nSaw this URL but couldn't parse it: {source}" if source else ""
+        await _reply(
+            update,
+            "No tracklist found automatically.\n"
+            f"{source_line}\n\n"
+            "Paste it manually with:\n"
+            "!tracklist Set Name\n"
+            "Artist - Title\n"
+            "Artist - Title\n"
+            "...\n\n"
+            "(Timestamps like `01:23 Artist - Title` also work.)",
+        )
+        return
+    if source:
+        await _reply(update, f"Found {len(tracks)} tracks via {source}")
     name = info.get("title") or "set"
     out = set_dir(name, output)
     await _download_tracks_with_progress(update, tracks, out, label=name)
@@ -428,6 +468,15 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await _reply(update, "!playlist expects a URL.")
                 return
             await _handle_playlist(update, m.group(0))
+            return
+
+        if text.lower().startswith("!full"):
+            payload = text[5:].strip()
+            m = URL_RE.search(payload)
+            if not m:
+                await _reply(update, "!full expects a URL.")
+                return
+            await _handle_url(update, m.group(0), variant, force_full=True)
             return
 
         if text.lower().startswith("!tracklist"):
