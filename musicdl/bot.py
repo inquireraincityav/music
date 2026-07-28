@@ -29,6 +29,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from functools import wraps
 from pathlib import Path
 from typing import Callable
@@ -254,6 +255,61 @@ async def _handle_url(update, url: str, variant: str | None) -> None:
     await _reply(update, f"Saved {result.filepath.name}")
 
 
+async def _download_tracks_with_progress(
+    update: Update,
+    tracks: list,
+    out_dir: Path,
+    label: str,
+) -> None:
+    """Download each track via search; edit a single status message as it goes."""
+    chat = update.effective_chat
+    n = len(tracks)
+    status = await chat.send_message(
+        f"{label}: 0/{n}\nSaving to {out_dir}"
+    )
+    last_edit = 0.0
+    ok = 0
+    failed: list[str] = []
+
+    async def edit(text: str, force: bool = False) -> None:
+        nonlocal last_edit
+        now = time.monotonic()
+        if not force and (now - last_edit) < 2.0:
+            return
+        try:
+            await status.edit_text(text[:3800])
+            last_edit = now
+        except Exception:
+            pass  # rate limit / race — safe to ignore
+
+    for i, entry in enumerate(tracks, 1):
+        await edit(
+            f"{label}: {i - 1}/{n}"
+            + (f" (failed {len(failed)})" if failed else "")
+            + f"\nNow: {entry.query}"
+        )
+        try:
+            await _run_in_thread(
+                download_search,
+                entry.title,
+                entry.artist,
+                None,
+                dest_dir=out_dir,
+                playlist_index=entry.index,
+                filename_hint=entry.query,
+            )
+            ok += 1
+        except Exception as e:
+            failed.append(f"[{entry.index}] {entry.query}: {e}")
+
+    final = f"{label}: {ok}/{n} done"
+    if failed:
+        preview = "\n".join(failed[:10])
+        more = f"\n… and {len(failed) - 10} more" if len(failed) > 10 else ""
+        final += f"\nFailed ({len(failed)}):\n{preview}{more}"
+    await edit(final, force=True)
+
+
 async def _handle_set(update, url: str) -> None:
     output = None
     await _reply(update, f"Parsing DJ set: {url}")
@@ -273,23 +329,7 @@ async def _handle_set(update, url: str) -> None:
         return
     name = info.get("title") or "set"
     out = set_dir(name, output)
-    await _reply(update, f"{len(tracks)} tracks -> {out}")
-    failed: list[str] = []
-    for entry in tracks:
-        try:
-            await _run_in_thread(
-                download_search,
-                entry.title,
-                entry.artist,
-                None,
-                dest_dir=out,
-                playlist_index=entry.index,
-                filename_hint=entry.query,
-            )
-        except Exception as e:
-            failed.append(f"[{entry.index}] {entry.query}: {e}")
-    tail = f"\nFailed: {len(failed)}\n" + "\n".join(failed) if failed else ""
-    await _reply(update, f"Done.{tail}")
+    await _download_tracks_with_progress(update, tracks, out, label=name)
 
 
 async def _handle_playlist(update, url: str) -> None:
@@ -327,23 +367,7 @@ async def _handle_tracklist_text(update, name: str, text: str) -> None:
         await _reply(update, "No tracks recognized in that message.")
         return
     out = set_dir(name, None)
-    await _reply(update, f"{len(tracks)} tracks -> {out}")
-    failed: list[str] = []
-    for entry in tracks:
-        try:
-            await _run_in_thread(
-                download_search,
-                entry.title,
-                entry.artist,
-                None,
-                dest_dir=out,
-                playlist_index=entry.index,
-                filename_hint=entry.query,
-            )
-        except Exception as e:
-            failed.append(f"[{entry.index}] {entry.query}: {e}")
-    tail = f"\nFailed: {len(failed)}\n" + "\n".join(failed) if failed else ""
-    await _reply(update, f"Done.{tail}")
+    await _download_tracks_with_progress(update, tracks, out, label=name)
 
 
 async def _handle_search(update, query: str, variant: str | None) -> None:
