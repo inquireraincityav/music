@@ -309,6 +309,8 @@ def _search_url(service: str, query: str) -> str:
         "youtube": f"https://www.youtube.com/results?search_query={q}",
         "soundcloud": f"https://soundcloud.com/search/sounds?q={q}",
         "beatport": f"https://www.beatport.com/search?q={q}",
+        "bandcamp": f"https://bandcamp.com/search?q={q}",
+        "traxsource": f"https://www.traxsource.com/search?term={q}",
         "1001tl": f"https://www.1001tracklists.com/search?q={q}",
     }[service]
 
@@ -316,22 +318,26 @@ def _search_url(service: str, query: str) -> str:
 def _explain_failure(msg: str) -> tuple[str, str]:
     """Return (short_reason, follow_up_hint) for a track download error."""
     m = msg.lower()
-    if "no search results" in m:
+    if "requested version" in m and "not found" in m:
         return (
-            "No YouTube matches.",
-            "Try SoundCloud/Beatport, or fix the spelling of artist/title.",
+            "Requested version (remix/edit/bootleg/mix) isn't on YouTube or SoundCloud — only the original (or nothing) is available.",
+            "Drop the version qualifier to grab the original, or check Beatport/Traxsource. "
+            "For bootlegs, split into source tracks instead.",
         )
-    if "no result under" in m and "min for" in m:
+    if "all results" in m and "too long" in m:
         return (
-            "All top matches were long DJ sets/mixes — track probably doesn't exist as a standalone.",
-            "If it's a bootleg/mashup, break it into source tracks. Otherwise "
-            "SoundCloud is where DJs post bootlegs; Beatport carries official releases.",
+            "Every candidate on YouTube and SoundCloud was longer than 12 min — track probably only exists inside longer DJ sets.",
+            "If it's a bootleg/mashup, break it into source tracks. Beatport/Traxsource carry official standalone releases.",
+        )
+    if "no usable result" in m or ("no youtube matches" in m and "no soundcloud" in m):
+        return (
+            "No matches on YouTube or SoundCloud.",
+            "Fix the spelling, or check Beatport/Bandcamp. Might be an obscure/unreleased ID.",
         )
     if "audio extraction produced no" in m or "extraction produced no" in m:
         return (
             "Top result had no extractable audio — likely age-restricted, DRM, or image-only.",
-            "Try SoundCloud/Beatport, or append --variant \"<channel or version>\" "
-            "to pick a different upload.",
+            "Append --variant \"<channel or version>\" to pick a different upload, or paste a direct URL.",
         )
     if "hit has no url" in m:
         return (
@@ -339,7 +345,7 @@ def _explain_failure(msg: str) -> tuple[str, str]:
             "Retry, or add --variant to steer the search.",
         )
     short = msg.split("\n")[0][:180]
-    return (short, "Try SoundCloud/Beatport, or paste a direct URL for this track.")
+    return (short, "Paste a direct URL for this track, or check Beatport/Bandcamp.")
 
 
 def _chunk_by_lines(text: str, limit: int = 3800) -> list[str]:
@@ -372,7 +378,8 @@ async def _send_failure_report(update: Update, failed: list[tuple[Any, str]]) ->
         yt = _search_url("youtube", query)
         sc = _search_url("soundcloud", query)
         bp = _search_url("beatport", query)
-        tl = _search_url("1001tl", query)
+        bc = _search_url("bandcamp", query)
+        tx = _search_url("traxsource", query)
         lines.append(f"<b>{entry.index}. {html_escape(query)}</b>")
         lines.append(f"  ↳ {html_escape(reason)}")
         if hint:
@@ -381,7 +388,8 @@ async def _send_failure_report(update: Update, failed: list[tuple[Any, str]]) ->
             f'  ↳ Search: <a href="{yt}">YouTube</a> · '
             f'<a href="{sc}">SoundCloud</a> · '
             f'<a href="{bp}">Beatport</a> · '
-            f'<a href="{tl}">1001tracklists</a>'
+            f'<a href="{bc}">Bandcamp</a> · '
+            f'<a href="{tx}">Traxsource</a>'
         )
         lines.append("")
     chat = update.effective_chat

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional
 
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
@@ -21,6 +22,17 @@ SPOTIFY_HOSTS = ("open.spotify.com", "spotify.com")
 # shows) and try up to N candidates before giving up.
 _SEARCH_MAX_DURATION_SEC = 720  # 12 minutes
 _SEARCH_MAX_RESULTS = 5
+
+# When the requested track name has a version qualifier in parens/brackets and
+# that text contains one of these keywords, the resulting search hit's title
+# must also contain the qualifier — otherwise we skip it. Prevents "downloaded
+# the original instead of the (VIP Mix)" surprises.
+_VERSION_KEYWORDS = re.compile(
+    r"\b(?:remix|mix|edit|bootleg|mashup|version|rework|rmx|vip|dub|"
+    r"extended|club|radio|instrumental|acapella|flip|refix)\b",
+    re.IGNORECASE,
+)
+_PAREN_CONTENT = re.compile(r"[\(\[]([^)\]]+)[\)\]]")
 
 
 @dataclass
@@ -111,23 +123,54 @@ def _cleanup_partials(target_mp3: Path) -> None:
             pass
 
 
-def _search_candidates(query: str, n: int = _SEARCH_MAX_RESULTS) -> list[dict]:
-    """Fetch top-N YouTube search result metadata (no download)."""
+def _extract_version_hint(query: str) -> Optional[str]:
+    """Return contents of the first (…) / […] block that includes a version
+    keyword. Used to require that our download's title contains the same
+    qualifier (so we don't get 'Original Mix' when 'VIP Mix' was requested).
+    """
+    for m in _PAREN_CONTENT.finditer(query):
+        content = m.group(1)
+        if _VERSION_KEYWORDS.search(content):
+            return content.strip()
+    return None
+
+
+def _normalize_for_match(s: str) -> str:
+    s = re.sub(r"[^\w\s]", " ", s.lower())
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _title_has_version(title: str, hint: str) -> bool:
+    if not hint:
+        return True
+    return _normalize_for_match(hint) in _normalize_for_match(title)
+
+
+def _search_candidates(
+    query: str,
+    n: int = _SEARCH_MAX_RESULTS,
+    engine: str = "ytsearch",
+) -> list[dict]:
+    """Fetch top-N search result metadata (no download) via a yt-dlp engine.
+
+    engine="ytsearch" for YouTube, "scsearch" for SoundCloud.
+    """
     opts = {
         "quiet": True,
         "skip_download": True,
         "extract_flat": "in_playlist",
         "noprogress": True,
-        "default_search": "ytsearch",
+        "default_search": engine,
     }
     with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(f"ytsearch{n}:{query}", download=False)
+        info = ydl.extract_info(f"{engine}{n}:{query}", download=False)
     return [e for e in (info.get("entries") or []) if e]
 
 
 def _pick_candidate(
     candidates: list[dict],
     max_dur: int = _SEARCH_MAX_DURATION_SEC,
+    version_hint: Optional[str] = None,
 ) -> tuple[dict | None, list[str]]:
     """Return (winning candidate, list of rejection reasons)."""
     reasons: list[str] = []
@@ -137,8 +180,39 @@ def _pick_candidate(
         if dur is not None and dur > max_dur:
             reasons.append(f"'{title}' too long ({int(dur)}s)")
             continue
+        if version_hint and not _title_has_version(title, version_hint):
+            reasons.append(f"'{title}' missing version '{version_hint}'")
+            continue
         return c, reasons
     return None, reasons
+
+
+def _search_and_download(
+    engine: str,
+    query: str,
+    version_hint: Optional[str],
+    dest_dir: Path,
+    filename_hint: Optional[str],
+    playlist_index: Optional[int],
+) -> "DownloadResult":
+    candidates = _search_candidates(query, engine=engine)
+    label = "YouTube" if engine == "ytsearch" else "SoundCloud"
+    if not candidates:
+        raise DownloadError(f"no {label} results for: {query}")
+    winner, reasons = _pick_candidate(candidates, version_hint=version_hint)
+    if not winner:
+        detail = "; ".join(reasons) if reasons else "no candidates"
+        raise DownloadError(f"no suitable {label} result for: {query} ({detail})")
+    url = winner.get("url") or winner.get("webpage_url")
+    if not url:
+        raise DownloadError(f"{label} hit has no URL for: {query}")
+    log.info("%s '%s' -> %s", engine, query, winner.get("title") or url)
+    return download_url(
+        url,
+        dest_dir=dest_dir,
+        filename_hint=filename_hint or query,
+        playlist_index=playlist_index,
+    )
 
 
 def download_url(
@@ -188,37 +262,47 @@ def download_search(
     playlist_index: int | None = None,
     filename_hint: str | None = None,
 ) -> DownloadResult:
-    """Search YouTube, filter to a plausible-length result, download it as MP3.
+    """Search YouTube then SoundCloud for a plausible-length matching result.
 
-    Iterates the top ``_SEARCH_MAX_RESULTS`` candidates and picks the first one
-    at or under ``_SEARCH_MAX_DURATION_SEC``. Raises DownloadError with the
-    rejection reasons if nothing passes — much better than silently returning
-    a random 90-minute DJ set that happens to feature the track.
+    If the query contains a version qualifier in parens (e.g. "(VIP Mix)",
+    "(Prospa Remix)", "(Extended Mix)"), only results whose title also
+    contains that qualifier are accepted — the "original mix" is not a valid
+    substitute. Errors distinguish "nothing found at all", "only wrong
+    version found", and "everything found was too long" so the bot can give
+    the user a specific hint.
     """
     query = _pick_search_query(title, artist, variant)
-    candidates = _search_candidates(query)
-    if not candidates:
-        raise DownloadError(f"No search results for: {query}")
+    version_hint = _extract_version_hint(query)
 
-    winner, reasons = _pick_candidate(candidates)
-    if not winner:
-        detail = "\n  ".join(reasons) if reasons else "no candidates"
-        raise DownloadError(
-            f"No result under {_SEARCH_MAX_DURATION_SEC // 60} min for: "
-            f"{query}\n  {detail}"
+    try:
+        return _search_and_download(
+            "ytsearch", query, version_hint, dest_dir, filename_hint, playlist_index
         )
+    except DownloadError as yt_err:
+        log.info("YouTube search failed for '%s': %s", query, yt_err)
+        yt_msg = str(yt_err)
 
-    url = winner.get("url") or winner.get("webpage_url")
-    if not url:
-        raise DownloadError(f"Search hit has no URL for: {query}")
-
-    log.info("search '%s' -> %s", query, winner.get("title") or url)
-    return download_url(
-        url,
-        dest_dir=dest_dir,
-        filename_hint=filename_hint or query,
-        playlist_index=playlist_index,
-    )
+    try:
+        return _search_and_download(
+            "scsearch", query, version_hint, dest_dir, filename_hint, playlist_index
+        )
+    except DownloadError as sc_err:
+        sc_msg = str(sc_err)
+        if version_hint:
+            raise DownloadError(
+                f"Requested version '{version_hint}' not found on YouTube or "
+                f"SoundCloud for: {query}\n  YT: {yt_msg}\n  SC: {sc_msg}"
+            )
+        if "too long" in yt_msg and "too long" in sc_msg:
+            raise DownloadError(
+                f"All results on YouTube and SoundCloud were too long "
+                f"(>{_SEARCH_MAX_DURATION_SEC // 60} min) for: {query}\n"
+                f"  YT: {yt_msg}\n  SC: {sc_msg}"
+            )
+        raise DownloadError(
+            f"No usable result on YouTube or SoundCloud for: {query}\n"
+            f"  YT: {yt_msg}\n  SC: {sc_msg}"
+        )
 
 
 def extract_playlist_entries(url: str) -> tuple[str, list[dict]]:
