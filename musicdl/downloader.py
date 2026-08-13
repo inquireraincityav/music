@@ -45,7 +45,7 @@ class DownloadResult:
 
 
 def _base_opts(output_template: str) -> dict:
-    return {
+    opts: dict = {
         "format": "bestaudio/best",
         "outtmpl": output_template,
         "postprocessors": [
@@ -77,6 +77,13 @@ def _base_opts(output_template: str) -> dict:
         "default_search": "ytsearch",
         "extract_flat": False,
     }
+    # Optional cookies file for authenticated services (BPMSupreme, DJcity,
+    # age-restricted YouTube, etc.). Point MUSICDL_COOKIES_FILE at a
+    # Netscape-format cookies.txt exported from your logged-in browser.
+    cookies_path = os.environ.get("MUSICDL_COOKIES_FILE")
+    if cookies_path and Path(cookies_path).is_file():
+        opts["cookiefile"] = cookies_path
+    return opts
 
 
 def _pick_search_query(
@@ -146,6 +153,20 @@ def _title_has_version(title: str, hint: str) -> bool:
     return _normalize_for_match(hint) in _normalize_for_match(title)
 
 
+def _probe_opts(default_search: str = "ytsearch") -> dict:
+    opts = {
+        "quiet": True,
+        "skip_download": True,
+        "extract_flat": "in_playlist",
+        "noprogress": True,
+        "default_search": default_search,
+    }
+    cookies_path = os.environ.get("MUSICDL_COOKIES_FILE")
+    if cookies_path and Path(cookies_path).is_file():
+        opts["cookiefile"] = cookies_path
+    return opts
+
+
 def _search_candidates(
     query: str,
     n: int = _SEARCH_MAX_RESULTS,
@@ -155,14 +176,7 @@ def _search_candidates(
 
     engine="ytsearch" for YouTube, "scsearch" for SoundCloud.
     """
-    opts = {
-        "quiet": True,
-        "skip_download": True,
-        "extract_flat": "in_playlist",
-        "noprogress": True,
-        "default_search": engine,
-    }
-    with YoutubeDL(opts) as ydl:
+    with YoutubeDL(_probe_opts(default_search=engine)) as ydl:
         info = ydl.extract_info(f"{engine}{n}:{query}", download=False)
     return [e for e in (info.get("entries") or []) if e]
 
@@ -307,13 +321,7 @@ def download_search(
 
 def extract_playlist_entries(url: str) -> tuple[str, list[dict]]:
     """Return (playlist_title, [entry_info,...]) without downloading."""
-    opts = {
-        "quiet": True,
-        "extract_flat": "in_playlist",
-        "skip_download": True,
-        "noprogress": True,
-    }
-    with YoutubeDL(opts) as ydl:
+    with YoutubeDL(_probe_opts()) as ydl:
         info = ydl.extract_info(url, download=False)
         if not info:
             return ("playlist", [])
@@ -352,7 +360,9 @@ def download_playlist_entries(
 
 def get_video_metadata(url: str) -> dict:
     """Return raw info dict for a URL (single video, no download)."""
-    opts = {"quiet": True, "skip_download": True, "noprogress": True, "noplaylist": True}
+    opts = _probe_opts()
+    opts.pop("extract_flat", None)
+    opts["noplaylist"] = True
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
         return info or {}

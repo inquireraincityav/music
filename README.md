@@ -200,6 +200,32 @@ allowlisted users. Keep `MUSICDL_SHELL_ENABLED=1` off unless you understand
 that, and keep the allowlist tight. Anyone with your bot token can pretend
 to be the bot, so treat it like a password.
 
+## Authenticated services (BPMSupreme, DJcity, private SoundCloud, etc.)
+
+For services where downloads require you to be logged in — paid DJ pools
+like BPMSupreme and DJcity, private SoundCloud sets, age-restricted
+YouTube — export your browser cookies to a Netscape-format `cookies.txt`
+and point `musicdl` at it:
+
+```bash
+export MUSICDL_COOKIES_FILE="/path/to/cookies.txt"
+```
+
+Both the CLI (`musicdl`) and the bot (`musicdl-bot`) will pick it up. The
+same file is forwarded to `spotdl` too, so any authenticated fallbacks
+also work.
+
+Recommended cookie export tool (browser extension, one click):
+
+- Chrome/Edge: [Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc)
+- Firefox: [cookies.txt](https://addons.mozilla.org/en-US/firefox/addon/cookies-txt/)
+
+Log in to the target site in your browser first, then export cookies for
+that site only (don't dump everything).
+
+Anyone with your cookies file can act as you on those sites — treat it
+like a password.
+
 ## Notes
 
 - The 320 kbps figure is the **MP3 encode bitrate**. Real audio fidelity is
