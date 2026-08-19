@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import glob as _glob
 import logging
 import os
 import re
@@ -119,9 +120,14 @@ def _verify_and_finalize(reported_path: str) -> Path:
 
 
 def _cleanup_partials(target_mp3: Path) -> None:
-    """Remove leftover .webp/.part/.jpg/.m4a etc. sitting next to target_mp3."""
+    """Remove leftover .webp/.part/.jpg/.m4a etc. sitting next to target_mp3.
+
+    Uses glob.escape so stems containing brackets (e.g. "Song [Extended Mix]")
+    or other glob-special chars still match the actual sibling files.
+    """
     stem = target_mp3.stem
-    for f in target_mp3.parent.glob(f"{stem}.*"):
+    pattern = _glob.escape(stem) + ".*"
+    for f in target_mp3.parent.glob(pattern):
         if f.suffix.lower() == ".mp3":
             continue
         try:
@@ -235,29 +241,53 @@ def download_url(
     filename_hint: str | None = None,
     playlist_index: int | None = None,
 ) -> DownloadResult:
-    """Download a single track URL as 320 kbps MP3 into dest_dir."""
+    """Download a single track URL as 320 kbps MP3 into dest_dir.
+
+    On any failure (yt-dlp raises, postprocess raises, or the expected
+    .mp3 doesn't land) any orphan thumbnail/.part/etc. files matching
+    the expected base name are removed so the destination folder doesn't
+    accumulate junk from failed downloads.
+    """
     dest_dir.mkdir(parents=True, exist_ok=True)
 
+    # Track an expected base path so we can clean up on failure even if
+    # yt-dlp raises before _verify_and_finalize is reached (e.g. thumbnail
+    # got written, then FFmpeg postprocess failed).
+    expected_base: Path | None = None
     if filename_hint:
         base = safe_filename(filename_hint)
         if playlist_index is not None:
             base = f"{playlist_index:02d} - {base}"
         outtmpl = str(dest_dir / f"{base}.%(ext)s")
+        expected_base = dest_dir / base
     else:
-        # Fall back to the track's own title.
         prefix = f"{playlist_index:02d} - " if playlist_index is not None else ""
         outtmpl = str(dest_dir / f"{prefix}%(title)s.%(ext)s")
 
     opts = _base_opts(outtmpl)
-    # Don't accidentally traverse playlists when caller passed a single item.
     opts["noplaylist"] = True
 
-    with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        if info is None:
-            raise DownloadError(f"No info returned for {url}")
-        reported = ydl.prepare_filename(info)
-        filepath = _verify_and_finalize(reported)
+    try:
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if info is None:
+                raise DownloadError(f"No info returned for {url}")
+            reported = ydl.prepare_filename(info)
+            filepath = _verify_and_finalize(reported)
+    except Exception:
+        # Best-effort orphan sweep. If we knew the base up-front, use it.
+        # Otherwise, if yt-dlp got far enough to expose the reported path,
+        # use that stem — captured in a nested try so the raise isn't
+        # swallowed if info was never bound.
+        if expected_base is not None:
+            _cleanup_partials(expected_base.with_suffix(".mp3"))
+        else:
+            try:
+                _cleanup_partials(Path(reported).with_suffix(".mp3"))  # type: ignore[name-defined]
+            except Exception:
+                pass
+        raise
+    else:
         return DownloadResult(
             filepath=filepath,
             title=info.get("title") or filepath.stem,
