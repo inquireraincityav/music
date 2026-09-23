@@ -24,6 +24,7 @@ browser = [
 [project.scripts]
 musicdl = "musicdl.cli:main"
 musicdl-bot = "musicdl.bot:main"
+musicdl-app = "musicdl.app:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

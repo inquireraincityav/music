@@ -97,6 +97,66 @@ musicdl --tracklist-file mySet.txt --name "Solomun @ Diynamic 2024"
 
 Each line can be `HH:MM Artist - Title` or just `Artist - Title`.
 
+## Desktop app (musicdl-app) — GUI on Mac + Windows
+
+Instead of running the bot from a terminal, install a double-clickable app.
+The Telegram bot runs inside the app while it's open, so downloads happen
+on whichever machine has the app running when a URL comes in from your
+phone. Close the app → bot stops cleanly.
+
+### Try it in dev (no packaging yet)
+
+Inside your existing venv:
+
+```bash
+pip install -e .
+musicdl-app
+```
+
+On first launch a settings dialog opens — paste your Telegram bot token,
+your numeric user id, pick a download folder, save. Bot starts polling.
+
+Config lives at:
+
+- macOS  : `~/Library/Application Support/musicdl/config.json`
+- Windows: `%APPDATA%\musicdl\config.json`
+- Linux  : `~/.config/musicdl/config.json`
+
+The CLI (`musicdl`) and the terminal bot (`musicdl-bot`) still work; the
+GUI is just a friendlier front door.
+
+### Build a real .app / .exe (bundled ffmpeg, no Python required on target)
+
+Run the build script **on** the target platform (no cross-compile):
+
+**macOS** (Apple Silicon or Intel — the script picks the right ffmpeg):
+
+```bash
+./build/build_mac.sh
+# Output: dist/musicdl.app
+open dist/musicdl.app
+```
+
+Move it to `/Applications`. On first launch macOS may block the unsigned
+app — right-click → **Open** → **Open Anyway**.
+
+**Windows** (from a `cmd` prompt or PowerShell in the repo root):
+
+```bat
+build\build_windows.bat
+REM Output: dist\musicdl.exe
+```
+
+Double-click `dist\musicdl.exe`. First launch: SmartScreen may warn about
+an unrecognized app — click **More info** → **Run anyway**.
+
+The bundled app carries its own static ffmpeg, so the target machine
+doesn't need Python, doesn't need ffmpeg installed, doesn't need
+Homebrew — just download the app and open it.
+
+Signed builds (no security warnings) require Apple/Microsoft developer
+certificates and aren't done here yet.
+
 ## DJ-set tracklist discovery
 
 When you use `!set <url>`, `musicdl` tries to find a tracklist in this order:

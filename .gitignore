@@ -2,6 +2,8 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
-build/
+build/vendor/ffmpeg
+build/vendor/ffmpeg.exe
+build/musicdl/
 dist/
 .env

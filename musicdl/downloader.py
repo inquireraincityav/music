@@ -4,6 +4,8 @@ import glob as _glob
 import logging
 import os
 import re
+import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -34,6 +36,23 @@ _VERSION_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 _PAREN_CONTENT = re.compile(r"[\(\[]([^)\]]+)[\)\]]")
+
+
+def _bundled_ffmpeg_dir() -> Optional[str]:
+    """Return the directory containing a bundled ffmpeg, if we're running in
+    a PyInstaller bundle that includes one; else None so yt-dlp falls back
+    to PATH resolution.
+    """
+    if not getattr(sys, "frozen", False):
+        return None
+    meipass = getattr(sys, "_MEIPASS", None)
+    if not meipass:
+        return None
+    exe = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+    candidate = Path(meipass) / exe
+    if candidate.is_file():
+        return str(candidate.parent)
+    return None
 
 
 @dataclass
@@ -84,6 +103,10 @@ def _base_opts(output_template: str) -> dict:
     cookies_path = os.environ.get("MUSICDL_COOKIES_FILE")
     if cookies_path and Path(cookies_path).is_file():
         opts["cookiefile"] = cookies_path
+    # PyInstaller bundle: use the ffmpeg we shipped inside the app.
+    ff_dir = _bundled_ffmpeg_dir()
+    if ff_dir:
+        opts["ffmpeg_location"] = ff_dir
     return opts
 
 
