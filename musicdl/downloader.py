@@ -671,7 +671,14 @@ def download_playlist_entries(
     entries: Iterable[dict],
     dest_dir: Path,
 ) -> list[DownloadResult]:
-    """Download each entry into dest_dir, numbered by playlist order."""
+    """Download each entry into dest_dir, numbered by playlist order.
+
+    We deliberately pass `filename_hint=None` so download_url's post-download
+    auto-rename kicks in, producing "Title - Artist.mp3" from yt-dlp's track
+    metadata. The yt-dlp playlist entry's own `title` is just the raw video
+    title (often "Artist - Title" or just the song name), which would short-
+    circuit the auto-rename and leave files inconsistently formatted.
+    """
     results: list[DownloadResult] = []
     for idx, entry in enumerate(entries, start=1):
         if not entry:
@@ -685,7 +692,7 @@ def download_playlist_entries(
             result = download_url(
                 url,
                 dest_dir=dest_dir,
-                filename_hint=title,
+                filename_hint=None,
                 playlist_index=idx,
             )
             results.append(result)
