@@ -142,6 +142,53 @@ def _verify_and_finalize(reported_path: str) -> Path:
     )
 
 
+def _preferred_stem_from_info(info: dict) -> Optional[str]:
+    """Build a 'Title - Artist' stem from yt-dlp metadata when both parts exist.
+
+    Prefers the track/artist fields that yt-dlp pulls out of music videos'
+    descriptions; falls back to None (caller keeps whatever filename yt-dlp
+    chose) when either side is missing.
+    """
+    title = (info.get("track") or info.get("title") or "").strip()
+    artist = (
+        info.get("artist")
+        or info.get("creator")
+        or info.get("uploader")
+        or ""
+    ).strip()
+    # Drop channel-style suffixes like " - Topic" that YT Music auto-appends.
+    if artist.endswith(" - Topic"):
+        artist = artist[: -len(" - Topic")].strip()
+    if not title or not artist:
+        return None
+    # Don't duplicate the artist if the title already contains it.
+    if artist.lower() in title.lower():
+        return title
+    return f"{title} - {artist}"
+
+
+def _rename_to_preferred(
+    mp3: Path,
+    info: dict,
+    playlist_index: Optional[int],
+) -> Path:
+    """Rename an untagged URL download to 'Title - Artist.mp3' when possible."""
+    stem = _preferred_stem_from_info(info)
+    if not stem:
+        return mp3
+    base = safe_filename(stem)
+    if playlist_index is not None:
+        base = f"{playlist_index:02d} - {base}"
+    target = mp3.with_name(f"{base}.mp3")
+    if target == mp3 or target.exists():
+        return mp3
+    try:
+        mp3.rename(target)
+    except OSError:
+        return mp3
+    return target
+
+
 def _cleanup_partials(target_mp3: Path) -> None:
     """Remove leftover .webp/.part/.jpg/.m4a etc. sitting next to target_mp3.
 
@@ -297,6 +344,10 @@ def download_url(
                 raise DownloadError(f"No info returned for {url}")
             reported = ydl.prepare_filename(info)
             filepath = _verify_and_finalize(reported)
+            # Only auto-rename when the caller didn't supply its own name —
+            # tracklist / playlist hints already encode "Title - Artist".
+            if filename_hint is None:
+                filepath = _rename_to_preferred(filepath, info, playlist_index)
     except Exception:
         # Best-effort orphan sweep. If we knew the base up-front, use it.
         # Otherwise, if yt-dlp got far enough to expose the reported path,

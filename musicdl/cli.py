@@ -66,7 +66,7 @@ def _run_set(url: str, root: Path | None, name_override: str | None) -> int:
                 variant=None,
                 dest_dir=out,
                 playlist_index=entry.index,
-                filename_hint=entry.query,
+                filename_hint=entry.filename,
             )
         except Exception as e:
             log.error("[%d] failed %s: %s", entry.index, entry.query, e)
@@ -113,7 +113,7 @@ def _run_tracklist_file(path: Path, root: Path, name: str) -> int:
                 variant=None,
                 dest_dir=out,
                 playlist_index=entry.index,
-                filename_hint=entry.query,
+                filename_hint=entry.filename,
             )
         except Exception as e:
             log.error("[%d] failed %s: %s", entry.index, entry.query, e)

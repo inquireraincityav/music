@@ -452,7 +452,7 @@ async def _download_tracks_with_progress(
                 None,
                 dest_dir=out_dir,
                 playlist_index=entry.index,
-                filename_hint=entry.query,
+                filename_hint=entry.filename,
             )
             ok += 1
         except Exception as e:

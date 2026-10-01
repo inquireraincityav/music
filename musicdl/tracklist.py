@@ -79,6 +79,13 @@ class TracklistEntry:
             return f"{self.artist} - {self.title}"
         return self.text
 
+    @property
+    def filename(self) -> str:
+        """Preferred on-disk stem: 'Title - Artist' when both are known."""
+        if self.artist and self.title:
+            return f"{self.title} - {self.artist}"
+        return self.text
+
 
 def _ts_to_seconds(ts: str) -> int:
     parts = [int(p) for p in ts.split(":")]
