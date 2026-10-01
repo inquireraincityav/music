@@ -10,7 +10,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
@@ -119,7 +119,10 @@ class DownloadResult:
     duration: float | None
 
 
-def _base_opts(output_template: str) -> dict:
+def _base_opts(
+    output_template: str,
+    progress_hook: Optional[Callable[[dict], None]] = None,
+) -> dict:
     opts: dict = {
         "format": "bestaudio/best",
         "outtmpl": output_template,
@@ -152,6 +155,8 @@ def _base_opts(output_template: str) -> dict:
         "default_search": "ytsearch",
         "extract_flat": False,
     }
+    if progress_hook is not None:
+        opts["progress_hooks"] = [progress_hook]
     # Optional cookies file for authenticated services (BPMSupreme, DJcity,
     # age-restricted YouTube, etc.). Point MUSICDL_COOKIES_FILE at a
     # Netscape-format cookies.txt exported from your logged-in browser.
@@ -497,6 +502,7 @@ def _search_and_download(
     dest_dir: Path,
     filename_hint: Optional[str],
     playlist_index: Optional[int],
+    progress_hook: Callable[[dict], None] | None = None,
 ) -> "DownloadResult":
     candidates = _search_candidates(query, engine=engine)
     label = "YouTube" if engine == "ytsearch" else "SoundCloud"
@@ -515,6 +521,7 @@ def _search_and_download(
         dest_dir=dest_dir,
         filename_hint=filename_hint or query,
         playlist_index=playlist_index,
+        progress_hook=progress_hook,
     )
 
 
@@ -602,6 +609,8 @@ def download_url(
     dest_dir: Path,
     filename_hint: str | None = None,
     playlist_index: int | None = None,
+    *,
+    progress_hook: Callable[[dict], None] | None = None,
 ) -> DownloadResult:
     """Download a single track URL as 320 kbps MP3 into dest_dir.
 
@@ -655,7 +664,7 @@ def download_url(
                 duration=expected_duration,
             )
 
-    opts = _base_opts(outtmpl)
+    opts = _base_opts(outtmpl, progress_hook=progress_hook)
     opts["noplaylist"] = True
 
     try:
@@ -729,6 +738,7 @@ def download_search(
     dest_dir: Path,
     playlist_index: int | None = None,
     filename_hint: str | None = None,
+    progress_hook: Callable[[dict], None] | None = None,
 ) -> DownloadResult:
     """Search YouTube then SoundCloud for a plausible-length matching result.
 
@@ -744,7 +754,8 @@ def download_search(
 
     try:
         return _search_and_download(
-            "ytsearch", query, version_hint, dest_dir, filename_hint, playlist_index
+            "ytsearch", query, version_hint, dest_dir, filename_hint, playlist_index,
+            progress_hook=progress_hook,
         )
     except DownloadError as yt_err:
         log.info("YouTube search failed for '%s': %s", query, yt_err)
@@ -752,7 +763,8 @@ def download_search(
 
     try:
         return _search_and_download(
-            "scsearch", query, version_hint, dest_dir, filename_hint, playlist_index
+            "scsearch", query, version_hint, dest_dir, filename_hint, playlist_index,
+            progress_hook=progress_hook,
         )
     except DownloadError as sc_err:
         sc_msg = str(sc_err)
@@ -782,6 +794,7 @@ def download_search_with_fallbacks(
     dest_dir: Path,
     playlist_index: int | None = None,
     filename_hint: str | None = None,
+    progress_hook: Callable[[dict], None] | None = None,
 ) -> DownloadResult:
     """Try `download_search` with progressively looser variants of the query.
 
@@ -813,6 +826,7 @@ def download_search_with_fallbacks(
                 dest_dir=dest_dir,
                 playlist_index=playlist_index,
                 filename_hint=filename_hint,
+                progress_hook=progress_hook,
             )
         except DownloadError as e:
             errors.append(f"[variant {i + 1}: {a or '-'} / {t or '-'}] {e}")

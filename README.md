@@ -270,10 +270,13 @@ WantedBy=default.target
 | `… --variant "Extended Mix"` | Steer to the right remix/edit version. |
 | `/git pull` | Pull latest code from the repo. |
 | `/shell <cmd>` | Run a shell command *(only if `MUSICDL_SHELL_ENABLED=1`)*. |
-| `/restart` | Exit; your process manager restarts the bot. |
+| `/restart` | Restart the bot in place (GUI: stops+starts the bot thread; terminal: re-execs the process). |
 | `/whoami` | Reply with your Telegram user id. |
 | `/queue` | List any jobs that were in flight when the bot last restarted. |
 | `/queue clear` | Drop everything from the pending queue. |
+| `/status` | Show what's downloading right now (bar, byte counts, current track in a set). |
+| `/cancel` | Abort the active download / set at the next byte and stop looping tracks. |
+| `/health` | Diagnostic: python / musicdl path, yt-dlp + ffmpeg versions, output dir writability + free disk, cookies file, pending queue depth, active job, bot uptime. |
 
 Files still land in `~/Desktop/MusicDownloads` on the machine running the
 bot — the phone just triggers the work.

@@ -26,6 +26,8 @@ class BotManager:
         self._app = None  # telegram.ext.Application
         self._started_event = threading.Event()
         self._error: Optional[Exception] = None
+        self._env: dict[str, str] = {}
+        self._restart_requested: bool = False
 
     # ---- public ----
 
@@ -36,6 +38,7 @@ class BotManager:
         """Start the bot with the given env vars applied to os.environ."""
         if self.is_running():
             return
+        self._env = dict(env)  # remember for restart
         for k, v in env.items():
             os.environ[k] = v
         self._error = None
@@ -44,6 +47,16 @@ class BotManager:
         self._thread.start()
         # Give the loop a moment to fail fast on bad token, etc.
         self._started_event.wait(timeout=8)
+
+    def restart(self) -> None:
+        """Called from Telegram /restart in GUI mode: stop + start the bot
+        thread while leaving the Tk main loop running."""
+        log.info("BotManager.restart invoked")
+        self._restart_requested = True
+        env = self._env
+        self.stop(timeout=10)
+        if env:
+            self.start(env)
 
     def error(self) -> Optional[Exception]:
         return self._error
@@ -78,9 +91,17 @@ class BotManager:
         self._loop = loop
         try:
             # Import here so env changes take effect for this run.
-            from .bot import build_app, _log_install_identity
+            from . import bot as _bot
+            from .bot import build_app
 
-            _log_install_identity()
+            _bot._log_install_identity()
+            # Register restart hook so Telegram /restart stops+starts this
+            # BotManager's thread instead of killing the GUI's Python process.
+            # Run it on a background thread so it can call self.stop (which
+            # blocks on the current thread exiting).
+            _bot.RESTART_HOOK = lambda: threading.Thread(
+                target=self.restart, daemon=True
+            ).start()
             app = build_app()
             self._app = app
             loop.run_until_complete(self._async_start(app))

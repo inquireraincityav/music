@@ -29,11 +29,13 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
+from dataclasses import dataclass, field
 from functools import wraps
 from html import escape as html_escape
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 from urllib.parse import quote_plus
 
 from telegram import Update
@@ -71,6 +73,181 @@ URL_RE = re.compile(r"https?://\S+")
 # Any video at least this long is treated as a probable DJ set / mix / show,
 # and we try to parse its tracklist automatically before downloading.
 _LONG_VIDEO_THRESHOLD_SEC = 20 * 60
+
+
+# ------------- cancellation + progress state (module-wide) -------------
+#
+# One shared cancel flag per bot — /cancel sets it, every active worker
+# checks it between tracks and at every yt-dlp progress tick, and the flag
+# is cleared automatically when the next job starts. Simple and sufficient
+# for a single-user bot.
+
+
+class UserCancelled(Exception):
+    """Raised from the yt-dlp progress hook when the user sent /cancel."""
+
+
+_CANCEL_EVENT = threading.Event()
+
+
+def _reset_cancel() -> None:
+    _CANCEL_EVENT.clear()
+
+
+def _is_cancelled() -> bool:
+    return _CANCEL_EVENT.is_set()
+
+
+@dataclass
+class ActiveJob:
+    """What the bot is currently doing (one at a time, by design)."""
+    kind: str                              # 'url' | 'set' | 'search' | …
+    label: str                             # human-readable description
+    started_at: float = field(default_factory=time.monotonic)
+    total: int = 0                         # tracks in set/playlist, 0 for single
+    done: int = 0
+    failed: int = 0
+    current_track: str = ""
+
+
+_ACTIVE_JOB: Optional[ActiveJob] = None
+_ACTIVE_LOCK = threading.Lock()
+
+
+def _set_active(job: Optional[ActiveJob]) -> None:
+    global _ACTIVE_JOB
+    with _ACTIVE_LOCK:
+        _ACTIVE_JOB = job
+
+
+def _update_active(**fields) -> None:
+    with _ACTIVE_LOCK:
+        if _ACTIVE_JOB is None:
+            return
+        for k, v in fields.items():
+            setattr(_ACTIVE_JOB, k, v)
+
+
+def _get_active() -> Optional[ActiveJob]:
+    with _ACTIVE_LOCK:
+        return _ACTIVE_JOB
+
+
+# Hook the GUI app registers so /restart stops+starts the in-thread bot
+# instead of killing the Python process (which would also close the window).
+# Terminal `musicdl-bot` leaves this None → /restart falls back to execv.
+RESTART_HOOK: Optional[Callable[[], None]] = None
+
+
+def _format_bar(fraction: float, width: int = 20) -> str:
+    """Unicode progress bar — e.g. [███████░░░░░░░]."""
+    fraction = max(0.0, min(1.0, fraction))
+    filled = int(fraction * width)
+    return "█" * filled + "░" * (width - filled)
+
+
+def _human_size(n: int | float | None) -> str:
+    if not n:
+        return "0 B"
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def _human_time(sec: int | float | None) -> str:
+    if not sec or sec < 0:
+        return "?"
+    sec = int(sec)
+    if sec < 60:
+        return f"{sec}s"
+    return f"{sec // 60}m{sec % 60:02d}s"
+
+
+class ProgressReporter:
+    """Edits one Telegram message with a live progress bar every ~2 seconds.
+
+    Thread-safe: yt-dlp calls on_progress from a worker thread; we marshal
+    the actual Telegram edits onto the bot's asyncio loop via
+    run_coroutine_threadsafe. Edits are rate-limited and failures (Telegram
+    429 / message-not-modified) are swallowed — progress is nice-to-have.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, chat, header: str) -> None:
+        self.loop = loop
+        self.chat = chat
+        self.header = header
+        self.msg = None
+        self._last_edit = 0.0
+        self._lock = threading.Lock()
+        self._done = False
+
+    async def start(self) -> None:
+        self.msg = await self.chat.send_message(f"{self.header}\n⏳ starting…")
+
+    def _render(self, d: dict) -> str:
+        status = d.get("status")
+        if status == "finished":
+            return f"{self.header}\n✅ downloaded, converting to MP3…"
+        total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+        done = d.get("downloaded_bytes") or 0
+        speed = d.get("speed") or 0
+        eta = d.get("eta") or 0
+        if total <= 0:
+            return (
+                f"{self.header}\n"
+                f"⏳ {_human_size(done)} ({_human_size(speed)}/s)"
+            )
+        pct = done / total
+        return (
+            f"{self.header}\n"
+            f"`{_format_bar(pct)}` {pct * 100:5.1f}%\n"
+            f"{_human_size(done)} / {_human_size(total)} · "
+            f"{_human_size(speed)}/s · ETA {_human_time(eta)}"
+        )
+
+    def on_progress(self, d: dict) -> None:
+        """yt-dlp hook — raises UserCancelled when /cancel was sent."""
+        if _is_cancelled():
+            raise UserCancelled("cancelled via /cancel")
+        now = time.monotonic()
+        with self._lock:
+            # Status "finished" always draws (shows the convert step).
+            if d.get("status") != "finished" and now - self._last_edit < 2.0:
+                return
+            self._last_edit = now
+        text = self._render(d)
+        if self.msg is None:
+            return
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                self.msg.edit_text(text[:3800], parse_mode=ParseMode.MARKDOWN),
+                self.loop,
+            )
+            # Don't block the worker thread waiting for the edit.
+            fut.add_done_callback(lambda _f: None)
+        except RuntimeError:
+            pass  # loop stopped — bot shutting down
+
+    async def finish(self, text: str) -> None:
+        self._done = True
+        if self.msg is None:
+            return
+        try:
+            await self.msg.edit_text(text[:3800])
+        except Exception:
+            pass
+
+
+def _make_cancellable_hook(reporter: Optional[ProgressReporter]) -> Callable[[dict], None]:
+    """Compose a yt-dlp progress_hook that also enforces the /cancel flag."""
+    def hook(d: dict) -> None:
+        if _is_cancelled():
+            raise UserCancelled("cancelled via /cancel")
+        if reporter is not None:
+            reporter.on_progress(d)
+    return hook
 
 
 def _parse_allowlist(raw: str | None) -> set[int]:
@@ -180,7 +357,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  !search <query>  — free-text search\n"
         "  !tracklist <name>\\n<lines>  — download a pasted tracklist\n\n"
         "Append --variant \"Extended Mix\" to steer version selection.\n\n"
-        "Commands: /whoami /git pull /restart"
+        "Live control:\n"
+        "  /status  — what's downloading right now\n"
+        "  /cancel  — stop the current download / set\n"
+        "  /health  — diagnostic: python, yt-dlp, ffmpeg, disk, cookies, queue\n"
+        "  /restart — restart the bot cleanly\n"
+        "  /queue   — list unfinished jobs across restarts\n\n"
+        "Admin: /whoami /git pull"
         + (" /shell" if SHELL_ENABLED else ""),
     )
 
@@ -235,11 +418,173 @@ async def cmd_shell(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _reply(update, "Restarting (relying on process manager).")
-    log.info("Exiting on /restart from %s", update.effective_user.id)
-    # Give Telegram a moment to flush the message before dying.
-    await asyncio.sleep(1)
-    sys.exit(0)
+    """Restart the bot in-place.
+
+    In the GUI app a RESTART_HOOK is registered that stops+starts the bot
+    thread without killing the Python process (which would also close the
+    window). In the terminal `musicdl-bot` the hook is None and we fall
+    back to re-execing the current process.
+    """
+    if _get_active() is not None:
+        await _reply(
+            update,
+            "⚠️ A download is in flight. Send /cancel first, or /restart again "
+            "to force.",
+        )
+        # Allow a second /restart within 30 s to force through.
+        global _RESTART_CONFIRMED_AT
+        if time.monotonic() - _RESTART_CONFIRMED_AT < 30:
+            pass  # user is forcing
+        else:
+            _RESTART_CONFIRMED_AT = time.monotonic()
+            return
+
+    await _reply(update, "🔄 Restarting bot…")
+    log.info("Restart requested by %s", update.effective_user.id)
+    _reset_cancel()
+    _set_active(None)
+    await asyncio.sleep(1)  # flush the message
+
+    if RESTART_HOOK is not None:
+        # GUI mode — hop off this loop before the hook stops it.
+        asyncio.get_event_loop().call_later(0.1, RESTART_HOOK)
+        return
+    # Terminal mode — re-exec in place so systemd/launchd isn't required.
+    try:
+        os.execv(sys.executable, [sys.executable, "-m", "musicdl.bot"])
+    except OSError as e:
+        log.warning("execv failed (%s), falling back to exit", e)
+        sys.exit(0)
+
+
+_RESTART_CONFIRMED_AT: float = 0.0
+
+
+@restricted
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel the active download / set."""
+    job = _get_active()
+    if job is None:
+        await _reply(update, "Nothing to cancel — no active download.")
+        return
+    _CANCEL_EVENT.set()
+    await _reply(
+        update,
+        f"⛔ Cancelling *{job.label}*…\nCurrent track aborts at the next "
+        f"byte; set stops after this track.",
+    )
+
+
+@restricted
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show what the bot is currently doing (0 or 1 active job)."""
+    job = _get_active()
+    if job is None:
+        await _reply(update, "💤 Idle. No active download.")
+        return
+    elapsed = time.monotonic() - job.started_at
+    lines = [
+        f"🎧 Active: *{job.label}*",
+        f"Kind: `{job.kind}` · running {_human_time(elapsed)}",
+    ]
+    if job.total > 1:
+        pct = job.done / job.total
+        lines.append(
+            f"`{_format_bar(pct)}` {job.done}/{job.total}"
+            + (f" · {job.failed} failed" if job.failed else "")
+        )
+        if job.current_track:
+            lines.append(f"Now: {job.current_track}")
+    lines.append("")
+    lines.append("Send /cancel to stop.")
+    await _reply(update, "\n".join(lines))
+
+
+@restricted
+async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Self-check so the user can see 'is the bot actually working?' at a glance.
+
+    Checks: python version, musicdl install path, yt-dlp/ffmpeg presence +
+    versions, output directory writability, cookies file validity, pending
+    queue depth, active job, uptime.
+    """
+    import importlib.metadata
+    import shutil
+
+    out = ["🩺 *musicdl health check*", ""]
+
+    # ---- Python / install identity
+    import musicdl
+    out.append(f"Python: `{sys.executable.split('/')[-1]}` {sys.version.split()[0]}")
+    out.append(f"musicdl path: `{Path(musicdl.__file__).parent}`")
+
+    # ---- yt-dlp
+    try:
+        yt_version = importlib.metadata.version("yt-dlp")
+        out.append(f"✅ yt-dlp {yt_version}")
+    except Exception as e:  # noqa: BLE001
+        out.append(f"❌ yt-dlp missing: {e}")
+
+    # ---- ffmpeg
+    try:
+        probe = subprocess.run(
+            ["ffmpeg", "-version"],
+            capture_output=True, text=True, timeout=5,
+        )
+        first = (probe.stdout or probe.stderr).splitlines()[0] if probe.returncode == 0 else "?"
+        if probe.returncode == 0:
+            out.append(f"✅ ffmpeg: {first[:80]}")
+        else:
+            out.append(f"❌ ffmpeg returned exit={probe.returncode}")
+    except FileNotFoundError:
+        out.append("❌ ffmpeg not on PATH — downloads will fail to transcode")
+    except Exception as e:  # noqa: BLE001
+        out.append(f"⚠️ ffmpeg check failed: {e}")
+
+    # ---- output dir
+    out_dir = Path(os.environ.get("MUSICDL_OUTPUT_DIR") or Path.home() / "Desktop" / "MusicDownloads")
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        probe = out_dir / ".musicdl-write-probe"
+        probe.write_text("ok")
+        probe.unlink()
+        free_mb = shutil.disk_usage(out_dir).free / 1024 / 1024
+        out.append(f"✅ output dir writable: `{out_dir}` ({free_mb:,.0f} MB free)")
+    except Exception as e:  # noqa: BLE001
+        out.append(f"❌ output dir not writable: `{out_dir}` ({e})")
+
+    # ---- cookies
+    cookies = os.environ.get("MUSICDL_COOKIES_FILE")
+    if cookies:
+        p = Path(cookies)
+        if p.is_file():
+            age = int((time.time() - p.stat().st_mtime) / 86400)
+            out.append(f"✅ cookies.txt: `{p.name}` (age {age}d)")
+        else:
+            out.append(f"❌ cookies file not found: `{cookies}`")
+    else:
+        out.append("ℹ️  no cookies file set (unauthenticated downloads only)")
+
+    # ---- state (queue, active)
+    pending = _state.peek_pending()
+    if pending:
+        out.append(f"⚠️ {len(pending)} job(s) in persistent queue — send /queue to see")
+    else:
+        out.append("✅ no pending jobs in queue")
+
+    job = _get_active()
+    if job is None:
+        out.append("💤 idle (no active download)")
+    else:
+        out.append(f"🎧 active: {job.label} ({job.done}/{job.total})")
+
+    uptime = time.monotonic() - _BOT_STARTED_AT
+    out.append(f"⏱ bot uptime: {_human_time(uptime)}")
+
+    await _reply(update, "\n".join(out))
+
+
+_BOT_STARTED_AT: float = time.monotonic()
 
 
 # ---------- download handlers ----------
@@ -257,9 +602,24 @@ async def _try_find_tracklist(update, info: dict):
 
 async def _download_as_full_video(update, url: str) -> None:
     out = single_dir(None)
-    result = await _run_in_thread(download_url, url, out, None, None)
-    await _reply(update, f"Saved {result.filepath.name}")
-    notify("musicdl", f"Saved {result.filepath.name}")
+    chat = update.effective_chat
+    loop = asyncio.get_event_loop()
+    reporter = ProgressReporter(loop, chat, f"⬇️ {url}")
+    await reporter.start()
+    hook = _make_cancellable_hook(reporter)
+    _reset_cancel()
+    _set_active(ActiveJob(kind="url", label=url, total=1))
+    try:
+        result = await _run_in_thread(
+            download_url, url, out, None, None, progress_hook=hook
+        )
+        await reporter.finish(f"✅ Saved {result.filepath.name}")
+        notify("musicdl", f"Saved {result.filepath.name}")
+    except UserCancelled:
+        await reporter.finish("⛔ Cancelled.")
+        _reset_cancel()
+    finally:
+        _set_active(None)
 
 
 async def _handle_url(update, url: str, variant: str | None, force_full: bool = False) -> None:
@@ -421,6 +781,10 @@ async def _download_tracks_with_progress(
 ) -> None:
     """Download each track via search; edit a single status message as it goes.
 
+    Rolling status includes a progress bar for the overall set + the current
+    track name + per-track byte progress. /cancel breaks out between tracks
+    AND aborts the in-flight yt-dlp fetch via the shared cancel event.
+
     On completion, sends a separate detailed failure report with per-track
     explanations and clickable search links if any tracks failed.
     """
@@ -432,6 +796,11 @@ async def _download_tracks_with_progress(
     last_edit = 0.0
     ok = 0
     failed: list[tuple[Any, str]] = []
+    current_pct: dict[str, Any] = {"frac": 0.0, "speed": 0, "eta": 0}
+
+    loop = asyncio.get_event_loop()
+    _reset_cancel()
+    _set_active(ActiveJob(kind="set", label=label, total=n))
 
     async def edit(text: str, force: bool = False) -> None:
         nonlocal last_edit
@@ -439,17 +808,38 @@ async def _download_tracks_with_progress(
         if not force and (now - last_edit) < 2.0:
             return
         try:
-            await status.edit_text(text[:3800])
+            await status.edit_text(text[:3800], parse_mode=ParseMode.MARKDOWN)
             last_edit = now
         except Exception:
-            pass  # rate limit / race — safe to ignore
+            pass  # rate limit / race / message not modified — safe to ignore
+
+    def _per_track_hook(d: dict) -> None:
+        if _is_cancelled():
+            raise UserCancelled("cancelled via /cancel")
+        total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+        done = d.get("downloaded_bytes") or 0
+        if total > 0:
+            current_pct["frac"] = done / total
+        current_pct["speed"] = d.get("speed") or 0
+        current_pct["eta"] = d.get("eta") or 0
 
     for i, entry in enumerate(tracks, 1):
-        await edit(
-            f"{label}: {i - 1}/{n}"
+        if _is_cancelled():
+            await edit(f"⛔ {label}: cancelled at track {i} of {n}", force=True)
+            _reset_cancel()
+            _set_active(None)
+            await _send_failure_report(update, failed)
+            return
+        current_pct["frac"] = 0.0
+        overall = (i - 1) / n
+        _update_active(done=i - 1, failed=len(failed), current_track=entry.query)
+        header = (
+            f"*{label}*\n"
+            f"`{_format_bar(overall)}` {ok}/{n}"
             + (f" · {len(failed)} failed" if failed else "")
-            + f"\nNow: {entry.query}"
+            + f"\nNow #{i}: {entry.query}"
         )
+        await edit(header)
         try:
             await _run_in_thread(
                 download_search_with_fallbacks,
@@ -460,15 +850,23 @@ async def _download_tracks_with_progress(
                 dest_dir=out_dir,
                 playlist_index=entry.index,
                 filename_hint=entry.filename,
+                progress_hook=_per_track_hook,
             )
             ok += 1
+        except UserCancelled:
+            await edit(f"⛔ {label}: cancelled during track {i}", force=True)
+            _reset_cancel()
+            _set_active(None)
+            await _send_failure_report(update, failed)
+            return
         except Exception as e:
             failed.append((entry, str(e)))
 
-    final = f"{label}: {ok}/{n} done"
+    final = f"✅ *{label}*: {ok}/{n} done"
     if failed:
         final += f" · {len(failed)} failed (details below)"
     await edit(final, force=True)
+    _set_active(None)
     await _send_failure_report(update, failed)
     notify(
         "musicdl",
@@ -548,18 +946,32 @@ async def _handle_tracklist_text(update, name: str, text: str) -> None:
 
 async def _handle_search(update, query: str, variant: str | None) -> None:
     out = single_dir(None)
-    await _reply(update, f"Searching: {query}" + (f' [{variant}]' if variant else ""))
-    result = await _run_in_thread(
-        download_search,
-        query,
-        None,
-        variant,
-        dest_dir=out,
-        playlist_index=None,
-        filename_hint=None,
-    )
-    await _reply(update, f"Saved {result.filepath.name}")
-    notify("musicdl", f"Saved {result.filepath.name}")
+    chat = update.effective_chat
+    header = f"🔎 {query}" + (f' [{variant}]' if variant else "")
+    loop = asyncio.get_event_loop()
+    reporter = ProgressReporter(loop, chat, header)
+    await reporter.start()
+    hook = _make_cancellable_hook(reporter)
+    _reset_cancel()
+    _set_active(ActiveJob(kind="search", label=query, total=1))
+    try:
+        result = await _run_in_thread(
+            download_search,
+            query,
+            None,
+            variant,
+            dest_dir=out,
+            playlist_index=None,
+            filename_hint=None,
+            progress_hook=hook,
+        )
+        await reporter.finish(f"✅ Saved {result.filepath.name}")
+        notify("musicdl", f"Saved {result.filepath.name}")
+    except UserCancelled:
+        await reporter.finish("⛔ Cancelled.")
+        _reset_cancel()
+    finally:
+        _set_active(None)
 
 
 def _classify(text: str) -> tuple[str, str]:
@@ -740,6 +1152,9 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("git", cmd_git))
     app.add_handler(CommandHandler("shell", cmd_shell))
     app.add_handler(CommandHandler("restart", cmd_restart))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("health", cmd_health))
     app.add_handler(CommandHandler("queue", cmd_queue))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     return app
