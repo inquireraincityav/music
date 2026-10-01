@@ -24,9 +24,11 @@ log = logging.getLogger("musicdl.downloader")
 SPOTIFY_HOSTS = ("open.spotify.com", "spotify.com")
 
 # Search behavior — reject overly long results (usually full DJ sets or radio
-# shows) and try up to N candidates before giving up.
+# shows) and try up to N candidates before giving up. We fetch a wider pool
+# than we need so the audio-vs-video preference ranking has something to pick
+# from; the extras don't cost much since this is metadata-only.
 _SEARCH_MAX_DURATION_SEC = 720  # 12 minutes
-_SEARCH_MAX_RESULTS = 5
+_SEARCH_MAX_RESULTS = 8
 
 # When the requested track name has a version qualifier in parens/brackets and
 # that text contains one of these keywords, the resulting search hit's title
@@ -310,13 +312,59 @@ def _search_candidates(
     return [e for e in (info.get("entries") or []) if e]
 
 
+_AUDIO_HINTS = re.compile(
+    r"\b(?:official\s+audio|audio\s+only|hq\s+audio|full\s+audio|just\s+audio)\b",
+    re.IGNORECASE,
+)
+# "Visualizer" uploads are audio with a stock loop — treat as audio-tier too.
+_AUDIO_TIER_EXTRAS = re.compile(r"\b(?:visualizer|visualiser|audio)\b", re.IGNORECASE)
+_VIDEO_HINTS = re.compile(
+    r"\b(?:official\s+(?:music\s+)?video|music\s+video|m/?v|"
+    r"official\s+mv|lyric\s+video|lyrics\s+video|live\s+performance|"
+    r"behind\s+the\s+scenes|dance\s+video|choreography)\b",
+    re.IGNORECASE,
+)
+
+
+def _preference_tier(candidate: dict) -> int:
+    """Rank a candidate 0 (best) → 3 (worst). Lower wins.
+
+    0 — Explicit audio upload ("Official Audio", "- Topic" uploader).
+    1 — Audio-ish (bare "Audio" or "Visualizer" in title).
+    2 — Neutral (no audio/video marker in title).
+    3 — Video upload ("Official Video", "Music Video", "Lyric Video").
+
+    "- Topic" channels are YouTube Music's auto-generated artist channels
+    and are always audio-only; they beat even an explicit "Official Audio"
+    upload because they're the actual master.
+    """
+    title = candidate.get("title") or ""
+    uploader = candidate.get("uploader") or candidate.get("channel") or ""
+    if uploader.strip().endswith("- Topic"):
+        return 0
+    if _AUDIO_HINTS.search(title):
+        return 0
+    if _VIDEO_HINTS.search(title):
+        return 3
+    if _AUDIO_TIER_EXTRAS.search(title):
+        return 1
+    return 2
+
+
 def _pick_candidate(
     candidates: list[dict],
     max_dur: int = _SEARCH_MAX_DURATION_SEC,
     version_hint: Optional[str] = None,
 ) -> tuple[dict | None, list[str]]:
-    """Return (winning candidate, list of rejection reasons)."""
+    """Return (winning candidate, list of rejection reasons).
+
+    First rejects anything that fails the duration + version-hint filter,
+    then returns the best remaining candidate by audio-vs-video preference
+    tier (audio uploads > neutral > video uploads). Ties within a tier are
+    broken by the search engine's own ordering (first-returned wins).
+    """
     reasons: list[str] = []
+    survivors: list[dict] = []
     for c in candidates:
         title = c.get("title") or c.get("id") or "?"
         dur = c.get("duration")
@@ -326,8 +374,21 @@ def _pick_candidate(
         if version_hint and not _title_has_version(title, version_hint):
             reasons.append(f"'{title}' missing version '{version_hint}'")
             continue
-        return c, reasons
-    return None, reasons
+        survivors.append(c)
+    if not survivors:
+        return None, reasons
+    survivors.sort(key=_preference_tier)
+    winner = survivors[0]
+    picked_tier = _preference_tier(winner)
+    if picked_tier > 0 and len(survivors) > 1:
+        # Log when we had to settle for a non-audio result, so the user can
+        # see WHY their search returned the "video" upload (no audio one existed).
+        log.info(
+            "no audio upload available; best remaining tier=%d title=%r",
+            picked_tier,
+            winner.get("title"),
+        )
+    return winner, reasons
 
 
 def _search_and_download(
