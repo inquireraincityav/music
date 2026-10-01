@@ -114,16 +114,48 @@ def _ts_to_seconds(ts: str) -> int:
     return 0
 
 
-def _split_artist_title(text: str) -> tuple[str | None, str | None]:
-    """Best-effort split on ' - ' (or unicode dash) into (artist, title).
+# Signals used to detect which side of a split is the ARTIST and which is
+# the TITLE. DJs write tracklists in both orders ("Artist - Title" and
+# "Title - Artist") so we can't rely on position alone.
 
-    Splits on the EARLIEST separator by position, not by separator-list order.
-    This matters for lines like "Drake – Best I Ever Had - EYJEY Flip" where
-    both ' – ' (en-dash, position 5) and ' - ' (ascii, position 23) are
-    present: the en-dash wins because it's the artist/title boundary; the
-    ascii hyphen is a loose version separator inside the title.
+# Features/collaborators mentioned → that side is likely the ARTIST list.
+_ARTIST_SIGNAL = re.compile(
+    r"\b(?:feat\.?|ft\.?|featuring|with|w/|vs\.?|&)\b",
+    re.IGNORECASE,
+)
+# Version qualifiers in parens/brackets → that side is likely the TITLE.
+# (A song's remix/edit/extended-mix qualifier always rides with the title,
+# never with the artist name.)
+_TITLE_SIGNAL_PARENS = re.compile(
+    r"[\(\[][^)\]]*\b(?:remix|mix|edit|bootleg|mashup|version|rework|rmx|"
+    r"vip|dub|extended|club|radio|instrumental|acapella|flip|refix|tweak|"
+    r"dirty|clean|short|long|intro|outro|drum|chop|chopped|screwed|slowed|"
+    r"sped\s*up|blend)\b[^)\]]*[\)\]]",
+    re.IGNORECASE,
+)
+
+
+def _split_artist_title(text: str) -> tuple[str | None, str | None]:
+    """Split on the earliest ' - ' (or unicode-dash variant), then LABEL
+    which side is artist and which is title.
+
+    Labelling heuristics, applied in order; first clear signal wins:
+
+      1. "feat." / "ft." / " & " / "with" / " vs. " present on one side →
+         that side is the artist list; the other is the title.
+      2. A paren block with a version qualifier (Remix/Edit/VIP Mix/…) on
+         one side → that side is the title; the other is the artist.
+      3. No clear signal → fall back to the convention most tracklists use:
+         left = artist, right = title.
+
+    Handles both "Artist - Title" and "Title - Artist" uploader conventions:
+      "Young Thug ft. J. Cole - The London"  → artist=Young Thug ft. J. Cole,
+                                                title=The London
+      "The London - Young Thug ft. J. Cole"  → artist=Young Thug ft. J. Cole,
+                                                title=The London   # same output
     """
     cleaned = _NUMBER_PREFIX.sub("", text).strip()
+
     best_idx = -1
     best_sep = ""
     for sep in _ARTIST_TITLE_SEPARATORS:
@@ -131,12 +163,33 @@ def _split_artist_title(text: str) -> tuple[str | None, str | None]:
         if idx != -1 and (best_idx == -1 or idx < best_idx):
             best_idx = idx
             best_sep = sep
-    if best_idx != -1:
-        left = cleaned[:best_idx].strip()
-        right = cleaned[best_idx + len(best_sep):].strip()
-        if left and right:
-            return left, right
-    return None, cleaned or None
+    if best_idx == -1:
+        return None, cleaned or None
+
+    left = cleaned[:best_idx].strip()
+    right = cleaned[best_idx + len(best_sep):].strip()
+    if not left or not right:
+        return None, cleaned or None
+
+    left_artist_sig = bool(_ARTIST_SIGNAL.search(left))
+    right_artist_sig = bool(_ARTIST_SIGNAL.search(right))
+    left_title_sig = bool(_TITLE_SIGNAL_PARENS.search(left))
+    right_title_sig = bool(_TITLE_SIGNAL_PARENS.search(right))
+
+    # 1. Features/collaborators point unambiguously at the artist side.
+    if left_artist_sig and not right_artist_sig:
+        return left, right        # left is artist
+    if right_artist_sig and not left_artist_sig:
+        return right, left        # right is artist → swap
+
+    # 2. Version qualifier parens point unambiguously at the title side.
+    if left_title_sig and not right_title_sig:
+        return right, left        # left is title → swap
+    if right_title_sig and not left_title_sig:
+        return left, right        # right is title → default order
+
+    # 3. No signals (or signals on both sides): default to Artist - Title.
+    return left, right
 
 
 def _has_artist_title_sep(text: str) -> bool:
