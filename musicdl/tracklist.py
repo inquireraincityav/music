@@ -88,9 +88,18 @@ class TracklistEntry:
 
     @property
     def filename(self) -> str:
-        """Preferred on-disk stem: 'Title - Artist' when both are known."""
+        """Preferred on-disk stem: 'Title - Artist' when both are known.
+
+        Logs every call so misbehaving installs (old venv, stale process, two
+        musicdl packages on sys.path) show up in the bot log immediately.
+        """
         if self.artist and self.title:
-            return f"{self.title} - {self.artist}"
+            out = f"{self.title} - {self.artist}"
+            import logging
+            logging.getLogger("musicdl.tracklist").info(
+                "FILENAME-ORDER=Title-Artist stem=%r", out
+            )
+            return out
         return self.text
 
 

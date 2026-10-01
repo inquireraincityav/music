@@ -745,11 +745,31 @@ def build_app() -> Application:
     return app
 
 
+def _log_install_identity() -> None:
+    """Make it obvious at startup which copy of musicdl is actually loaded,
+    so the "I pulled new code but the bot still runs old behavior" class of
+    bug can be diagnosed in one line of the log."""
+    import musicdl
+    from . import tracklist as _tl
+
+    marker = "Title-Artist"  # bump this string whenever the format changes
+    log.info("musicdl package loaded from: %s", Path(musicdl.__file__).parent)
+    log.info("python executable: %s", sys.executable)
+    log.info("FILENAME-FORMAT=%s (TracklistEntry.filename)", marker)
+    # Sanity check: construct a known entry and log the actual output.
+    probe = _tl.TracklistEntry(
+        index=1, timestamp="00:00", seconds=0,
+        text="Fisher - Losing It", artist="Fisher", title="Losing It",
+    )
+    log.info("sanity probe: artist='Fisher' title='Losing It' -> %r", probe.filename)
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    _log_install_identity()
     app = build_app()
     log.info("Bot starting. Allowlist: %s", sorted(ALLOWED_USER_IDS))
     app.run_polling(allowed_updates=Update.ALL_TYPES)

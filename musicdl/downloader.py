@@ -244,6 +244,59 @@ def _rename_to_preferred(
     return target
 
 
+def _enforce_title_artist_order(
+    mp3: Path,
+    info: dict,
+    playlist_index: Optional[int],
+) -> Path:
+    """If the current filename is 'Artist - Title' but metadata says it should
+    be 'Title - Artist', flip it. Used as a last-line defense against any
+    code path that still hands us a hint in the old order.
+
+    No-op unless yt-dlp's metadata provides BOTH `track` (song title) and
+    `artist` so we can confidently decide which part is which.
+    """
+    track = (info.get("track") or "").strip()
+    artist_raw = (info.get("artist") or "").strip()
+    if not track or not artist_raw:
+        return mp3  # nothing to compare against — leave the hint intact
+
+    # Strip the "NN - " playlist prefix from the current stem for comparison.
+    stem = mp3.stem
+    prefix = ""
+    m = re.match(r"^(\d{2,3}\s*[-\.]\s*)(.+)$", stem)
+    if m:
+        prefix = m.group(1)
+        core = m.group(2)
+    else:
+        core = stem
+
+    def norm(s: str) -> str:
+        return re.sub(r"\s+", " ", s.lower()).strip()
+
+    # Candidate "Title - Artist" and "Artist - Title" strings per metadata.
+    want = f"{track} - {artist_raw}"
+    reversed_form = f"{artist_raw} - {track}"
+
+    if norm(core) == norm(want):
+        return mp3  # already correct
+    if norm(core) == norm(reversed_form):
+        # Confidently in the wrong order — flip it.
+        new_core = safe_filename(want)
+        target = mp3.with_name(f"{prefix}{new_core}.mp3")
+        if target == mp3 or target.exists():
+            return mp3
+        try:
+            mp3.rename(target)
+            log.info("flipped filename order: %r -> %r", mp3.name, target.name)
+            return target
+        except OSError:
+            return mp3
+    # Hint didn't match either canonical form (e.g. an extended qualifier the
+    # metadata doesn't carry) — leave it alone.
+    return mp3
+
+
 def _cleanup_partials(target_mp3: Path) -> None:
     """Remove leftover .webp/.part/.jpg/.m4a etc. sitting next to target_mp3.
 
@@ -570,6 +623,14 @@ def download_url(
             # tracklist / playlist hints already encode "Title - Artist".
             if filename_hint is None:
                 filepath = _rename_to_preferred(filepath, info, playlist_index)
+            else:
+                # Belt-and-braces: even when a hint was supplied, if yt-dlp's
+                # metadata unambiguously gives us track + artist AND the hint
+                # looks like it's in reverse order ("Artist - Title") we flip
+                # the file to canonical "Title - Artist". Protects against an
+                # old caller (stale process, pre-pull entry.query call) still
+                # feeding us hints in the deprecated order.
+                filepath = _enforce_title_artist_order(filepath, info, playlist_index)
 
             # Verify we got the whole thing — ffmpeg sometimes writes a short
             # fragment and reports success. Only enforced when both the probe

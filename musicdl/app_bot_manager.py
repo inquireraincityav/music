@@ -78,8 +78,9 @@ class BotManager:
         self._loop = loop
         try:
             # Import here so env changes take effect for this run.
-            from .bot import build_app
+            from .bot import build_app, _log_install_identity
 
+            _log_install_identity()
             app = build_app()
             self._app = app
             loop.run_until_complete(self._async_start(app))
