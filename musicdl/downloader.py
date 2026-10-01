@@ -34,7 +34,9 @@ _SEARCH_MAX_RESULTS = 5
 # the original instead of the (VIP Mix)" surprises.
 _VERSION_KEYWORDS = re.compile(
     r"\b(?:remix|mix|edit|bootleg|mashup|version|rework|rmx|vip|dub|"
-    r"extended|club|radio|instrumental|acapella|flip|refix)\b",
+    r"extended|club|radio|instrumental|acapella|flip|refix|tweak|"
+    r"dirty|clean|short|long|intro|outro|drum|chop|chopped|screwed|"
+    r"slowed|sped\s*up|mashup|blend)\b",
     re.IGNORECASE,
 )
 _PAREN_CONTENT = re.compile(r"[\(\[]([^)\]]+)[\)\]]")

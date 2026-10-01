@@ -106,14 +106,27 @@ def _ts_to_seconds(ts: str) -> int:
 
 
 def _split_artist_title(text: str) -> tuple[str | None, str | None]:
-    """Best-effort split on ' - ' (or unicode dash) into (artist, title)."""
+    """Best-effort split on ' - ' (or unicode dash) into (artist, title).
+
+    Splits on the EARLIEST separator by position, not by separator-list order.
+    This matters for lines like "Drake – Best I Ever Had - EYJEY Flip" where
+    both ' – ' (en-dash, position 5) and ' - ' (ascii, position 23) are
+    present: the en-dash wins because it's the artist/title boundary; the
+    ascii hyphen is a loose version separator inside the title.
+    """
     cleaned = _NUMBER_PREFIX.sub("", text).strip()
+    best_idx = -1
+    best_sep = ""
     for sep in _ARTIST_TITLE_SEPARATORS:
-        if sep in cleaned:
-            left, right = cleaned.split(sep, 1)
-            left, right = left.strip(), right.strip()
-            if left and right:
-                return left, right
+        idx = cleaned.find(sep)
+        if idx != -1 and (best_idx == -1 or idx < best_idx):
+            best_idx = idx
+            best_sep = sep
+    if best_idx != -1:
+        left = cleaned[:best_idx].strip()
+        right = cleaned[best_idx + len(best_sep):].strip()
+        if left and right:
+            return left, right
     return None, cleaned or None
 
 
@@ -324,25 +337,40 @@ def parse_tracklist_from_info(info: dict) -> list[TracklistEntry]:
 # user asked for.
 
 _PAREN = re.compile(r"\s*[\(\[][^)\]]*[\)\]]\s*")
-_FEAT = re.compile(r"\s*(?:feat\.?|ft\.?|featuring)\s+[^-–—()\[\]]+", re.IGNORECASE)
-_WITH = re.compile(r"\s*(?:with|w/|&|x|vs\.?)\s+[^-–—()\[\]]+", re.IGNORECASE)
+# `feat. X`, `ft. X`, `ft X` (no period), `featuring X`.
+_FEAT = re.compile(
+    r"\s*(?:feat\.?|ft\.?|featuring)\s+[^-–—()\[\]]+",
+    re.IGNORECASE,
+)
+# Timestamp prefix like `12:34 ` or `12:34. ` at the start of a line.
+_LEADING_TS = re.compile(r"^\s*(?:\d{1,2}:)?\d{1,2}:\d{2}\s*[\.\-:]?\s+")
 
 
-def search_variants(artist: str | None, title: str | None, text: str) -> list[tuple[str | None, str | None]]:
+def _strip_leading_timestamp(text: str) -> str:
+    return _LEADING_TS.sub("", text).strip()
+
+
+def search_variants(
+    artist: str | None,
+    title: str | None,
+    text: str,
+) -> list[tuple[str | None, str | None]]:
     """Progressive fallbacks for a single track. Each item is (artist, title)
-    where either may be None (passed to download_search which also accepts
-    None/None + raw text via the caller's own fallback).
+    passed to download_search; the first success wins.
 
-    Example:
-      "Fisher", "Losing It (VIP Mix) feat. Someone"
-       → [
-            ("Fisher", "Losing It (VIP Mix) feat. Someone"),   # original
-            ("Fisher", "Losing It (VIP Mix)"),                  # drop feat.
-            ("Fisher", "Losing It"),                            # drop parens too
-            (None, "Fisher Losing It"),                         # flattened
-         ]
+    Order is tuned around a user observation: on messy tracklist lines the
+    *raw whole line* often matches YouTube/SoundCloud uploads better than
+    anything our structured splitter produces (uploaders name their files
+    exactly like the DJ's tracklist entry). So the whole-line attempt sits
+    second — right after the structured query, before we start stripping
+    bits off.
 
-    The caller invokes download_search once per tuple; the first success wins.
+    Example on "T-Pain – Buy You A Drank (Dan Bravo Remix)":
+      1. ("T-Pain",  "Buy You A Drank (Dan Bravo Remix)")   # structured
+      2. (None,      "T-Pain Buy You A Drank (Dan Bravo Remix)")  # raw line
+      3. ("T-Pain",  "Buy You A Drank Dan Bravo Remix")     # parens unwrapped
+      4. ("T-Pain",  "Buy You A Drank")                     # parens dropped
+      5. (None,      "T-Pain Buy You A Drank")              # flattened
     """
     seen: set[tuple[str | None, str | None]] = set()
     out: list[tuple[str | None, str | None]] = []
@@ -358,23 +386,32 @@ def search_variants(artist: str | None, title: str | None, text: str) -> list[tu
         seen.add(key)
         out.append(key)
 
-    # 1. The original query.
+    # 1. The structured query (what the splitter gave us).
     add(artist, title)
 
-    # 2. Strip "feat. X" / "ft. X" from the title.
+    # 2. The RAW whole tracklist line — timestamps stripped if present.
+    #    Users report this often finds uploads named exactly like the line.
+    if text:
+        add(None, _strip_leading_timestamp(text))
+
     if title:
+        # 3. Keep version info but unwrap parens — some uploads list the mix
+        #    inline without brackets, e.g. "Dan Bravo Remix" not "(Dan Bravo Remix)".
+        unwrapped = re.sub(r"[\(\[\)\]]", "", title)
+        unwrapped = re.sub(r"\s+", " ", unwrapped).strip()
+        add(artist, unwrapped)
+        # 4. Strip "feat. X" / "ft X" phrasing from the title.
         no_feat = _FEAT.sub("", title).strip()
-        add(artist, no_feat)
-        # 3. Strip "(…)" and "[…]" blocks entirely from the title.
+        if no_feat != title:
+            add(artist, no_feat)
+        # 5. Strip "(…)" blocks entirely — most permissive, most likely to
+        #    land on the wrong version (that's what version-hint matching is
+        #    for in the downloader).
         no_paren = _PAREN.sub(" ", no_feat).strip()
         add(artist, no_paren)
-        # 4. Try searching title + artist flattened (handles cases where the
-        #    artist field has multiple names joined with " & " / " x ").
+        # 6. Flattened artist + title (handles collaborations, "x", "&").
         if artist:
             flat = f"{artist} {no_paren}".strip()
             add(None, flat)
-    # 5. Last resort: use the raw tracklist line.
-    if text:
-        add(None, text)
 
     return out
