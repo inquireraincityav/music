@@ -249,52 +249,66 @@ def _enforce_title_artist_order(
     info: dict,
     playlist_index: Optional[int],
 ) -> Path:
-    """If the current filename is 'Artist - Title' but metadata says it should
-    be 'Title - Artist', flip it. Used as a last-line defense against any
-    code path that still hands us a hint in the old order.
+    """If the current filename's two sides are swapped relative to yt-dlp's
+    metadata (artist on the LEFT, title on the RIGHT), flip it so title
+    comes first.
 
-    No-op unless yt-dlp's metadata provides BOTH `track` (song title) and
-    `artist` so we can confidently decide which part is which.
+    Uses fuzzy substring containment rather than exact string match: the
+    tracklist entry may add 'ft. X' or '(VIP Mix)' qualifiers that yt-dlp's
+    bare `track`/`artist` fields don't carry, and vice-versa — we just need
+    to know which SIDE of the ' - ' is which. No-op when metadata is
+    missing (nothing to compare against).
     """
     track = (info.get("track") or "").strip()
-    artist_raw = (info.get("artist") or "").strip()
-    if not track or not artist_raw:
-        return mp3  # nothing to compare against — leave the hint intact
+    artist = (info.get("artist") or info.get("creator") or "").strip()
+    if artist.endswith(" - Topic"):
+        artist = artist[: -len(" - Topic")].strip()
+    if not track or not artist:
+        return mp3
 
-    # Strip the "NN - " playlist prefix from the current stem for comparison.
     stem = mp3.stem
-    prefix = ""
     m = re.match(r"^(\d{2,3}\s*[-\.]\s*)(.+)$", stem)
-    if m:
-        prefix = m.group(1)
-        core = m.group(2)
-    else:
-        core = stem
+    prefix = m.group(1) if m else ""
+    core = m.group(2) if m else stem
 
-    def norm(s: str) -> str:
-        return re.sub(r"\s+", " ", s.lower()).strip()
+    if " - " not in core:
+        return mp3
 
-    # Candidate "Title - Artist" and "Artist - Title" strings per metadata.
-    want = f"{track} - {artist_raw}"
-    reversed_form = f"{artist_raw} - {track}"
+    # Split at FIRST ' - ' (what safe_filename and our hint builder use).
+    left, _, right = core.partition(" - ")
 
-    if norm(core) == norm(want):
-        return mp3  # already correct
-    if norm(core) == norm(reversed_form):
-        # Confidently in the wrong order — flip it.
-        new_core = safe_filename(want)
-        target = mp3.with_name(f"{prefix}{new_core}.mp3")
-        if target == mp3 or target.exists():
-            return mp3
-        try:
-            mp3.rename(target)
-            log.info("flipped filename order: %r -> %r", mp3.name, target.name)
-            return target
-        except OSError:
-            return mp3
-    # Hint didn't match either canonical form (e.g. an extended qualifier the
-    # metadata doesn't carry) — leave it alone.
-    return mp3
+    # Use the first "significant" word of each metadata field for matching —
+    # cheaper than full containment and more forgiving when the entry has
+    # extra ft./featuring/version chatter.
+    def contains(hay: str, needle: str) -> bool:
+        if not needle:
+            return False
+        return needle.lower() in hay.lower()
+
+    left_has_artist = contains(left, artist)
+    right_has_artist = contains(right, artist)
+    left_has_track = contains(left, track)
+    right_has_track = contains(right, track)
+
+    # Currently Artist-Title: artist on left, track on right, unambiguous.
+    is_artist_title = (
+        left_has_artist
+        and right_has_track
+        and not (right_has_artist and left_has_track)
+    )
+    if not is_artist_title:
+        return mp3
+
+    new_core = f"{right} - {left}"
+    target = mp3.with_name(f"{prefix}{safe_filename(new_core)}.mp3")
+    if target == mp3 or target.exists():
+        return mp3
+    try:
+        mp3.rename(target)
+        log.info("flipped to Title-Artist order: %r -> %r", mp3.name, target.name)
+        return target
+    except OSError:
+        return mp3
 
 
 def _cleanup_partials(target_mp3: Path) -> None:
