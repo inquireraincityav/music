@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import glob as _glob
+import json
 import logging
 import os
 import re
 import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,6 +55,55 @@ def _bundled_ffmpeg_dir() -> Optional[str]:
     if candidate.is_file():
         return str(candidate.parent)
     return None
+
+
+def _ffprobe_cmd() -> Optional[str]:
+    """Locate ffprobe (prefer the bundled copy sitting next to ffmpeg)."""
+    ff_dir = _bundled_ffmpeg_dir()
+    if ff_dir:
+        exe = "ffprobe.exe" if sys.platform == "win32" else "ffprobe"
+        candidate = Path(ff_dir) / exe
+        if candidate.is_file():
+            return str(candidate)
+    return shutil.which("ffprobe")
+
+
+def probe_duration(path: Path) -> Optional[float]:
+    """Return a file's duration in seconds via ffprobe, or None if it can't tell."""
+    probe = _ffprobe_cmd()
+    if not probe:
+        return None
+    try:
+        out = subprocess.run(
+            [
+                probe, "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "json", str(path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        data = json.loads(out.stdout or "{}")
+        dur = data.get("format", {}).get("duration")
+        return float(dur) if dur else None
+    except (subprocess.SubprocessError, json.JSONDecodeError, ValueError, OSError):
+        return None
+
+
+# Tolerance for "did we download the whole thing?" checks. 5 seconds + 3% of
+# the expected duration — wider for long files, strict for short ones.
+_DURATION_ABS_TOL = 5.0
+_DURATION_REL_TOL = 0.03
+
+
+def _durations_match(actual: Optional[float], expected: Optional[float]) -> bool:
+    """True if actual duration is within tolerance of expected."""
+    if not actual or not expected:
+        return False
+    tol = max(_DURATION_ABS_TOL, expected * _DURATION_REL_TOL)
+    return abs(actual - expected) <= tol
 
 
 @dataclass
@@ -305,6 +356,85 @@ def _search_and_download(
     )
 
 
+def _parse_mirror_dirs() -> list[Path]:
+    """Mirror roots to copy every finished MP3 into (iCloud, external drive…)."""
+    raw = os.environ.get("MUSICDL_MIRROR_DIRS", "").strip()
+    if not raw:
+        return []
+    out: list[Path] = []
+    for part in raw.split(os.pathsep if os.pathsep in raw else ","):
+        s = part.strip()
+        if not s:
+            continue
+        p = Path(s).expanduser()
+        out.append(p)
+    return out
+
+
+def _mirror_copy(filepath: Path, primary_root: Path) -> None:
+    """Copy filepath into every configured mirror root, preserving the
+    sub-path under primary_root (Singles/, Playlists/<name>/, Sets/<name>/)."""
+    mirrors = _parse_mirror_dirs()
+    if not mirrors:
+        return
+    try:
+        rel = filepath.resolve().relative_to(primary_root.resolve())
+    except ValueError:
+        # File isn't under the primary root — just mirror the filename.
+        rel = Path(filepath.name)
+    for mroot in mirrors:
+        target = mroot / rel
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists() and target.stat().st_size == filepath.stat().st_size:
+                continue  # already mirrored
+            shutil.copy2(filepath, target)
+            log.info("mirrored -> %s", target)
+        except OSError as e:
+            log.warning("mirror copy failed for %s -> %s: %s", filepath, target, e)
+
+
+def _primary_root() -> Path:
+    """The configured download root (used to compute mirror sub-paths)."""
+    return Path(
+        os.environ.get("MUSICDL_OUTPUT_DIR") or (Path.home() / "Desktop" / "MusicDownloads")
+    )
+
+
+def _probe_expected_duration(url: str) -> Optional[float]:
+    """Fetch a URL's expected duration without downloading (metadata only)."""
+    try:
+        with YoutubeDL(_probe_opts()) as ydl:
+            info = ydl.extract_info(url, download=False)
+        if not info:
+            return None
+        dur = info.get("duration")
+        return float(dur) if dur else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _existing_match(target_mp3: Path, expected_dur: Optional[float]) -> Optional[Path]:
+    """If target_mp3 already exists AND its duration matches expected, return it.
+
+    Lets re-sent URLs skip in-place instead of re-downloading. Falls back to a
+    bare size check when ffprobe isn't available or we don't know the
+    expected duration.
+    """
+    if not target_mp3.exists() or target_mp3.stat().st_size == 0:
+        return None
+    if expected_dur:
+        actual = probe_duration(target_mp3)
+        if actual is not None and _durations_match(actual, expected_dur):
+            return target_mp3
+        # Known mismatch — pretend it's not there so the re-download overwrites.
+        return None
+    # Unknown expected duration: trust the file if it's non-trivially sized.
+    if target_mp3.stat().st_size > 50_000:
+        return target_mp3
+    return None
+
+
 def download_url(
     url: str,
     dest_dir: Path,
@@ -312,6 +442,20 @@ def download_url(
     playlist_index: int | None = None,
 ) -> DownloadResult:
     """Download a single track URL as 320 kbps MP3 into dest_dir.
+
+    Skip-if-already-downloaded: when the target file already exists and its
+    duration matches what the URL claims, we return the existing file instead
+    of re-downloading. This makes re-sending a URL (or re-running a half-
+    finished set) idempotent.
+
+    Duration verification: after a fresh download we probe the mp3 and compare
+    against yt-dlp's reported duration. A silent truncation (ffmpeg wrote 30s
+    of a 4-minute song) raises instead of returning quietly.
+
+    Mirror copy: after a successful download the file is copied into every
+    directory listed in MUSICDL_MIRROR_DIRS (preserving the Singles/Playlists/
+    Sets sub-path) so a second machine (via iCloud, Dropbox, SMB mount) sees
+    it without running a bot there.
 
     On any failure (yt-dlp raises, postprocess raises, or the expected
     .mp3 doesn't land) any orphan thumbnail/.part/etc. files matching
@@ -334,6 +478,21 @@ def download_url(
         prefix = f"{playlist_index:02d} - " if playlist_index is not None else ""
         outtmpl = str(dest_dir / f"{prefix}%(title)s.%(ext)s")
 
+    # Resume: if we have an obvious expected filename and the file is already
+    # there with the right duration, skip and report the existing file.
+    expected_duration = _probe_expected_duration(url)
+    if expected_base is not None:
+        hit = _existing_match(expected_base.with_suffix(".mp3"), expected_duration)
+        if hit is not None:
+            log.info("skip (already have %s)", hit.name)
+            return DownloadResult(
+                filepath=hit,
+                title=hit.stem,
+                uploader=None,
+                source_url=url,
+                duration=expected_duration,
+            )
+
     opts = _base_opts(outtmpl)
     opts["noplaylist"] = True
 
@@ -348,11 +507,19 @@ def download_url(
             # tracklist / playlist hints already encode "Title - Artist".
             if filename_hint is None:
                 filepath = _rename_to_preferred(filepath, info, playlist_index)
+
+            # Verify we got the whole thing — ffmpeg sometimes writes a short
+            # fragment and reports success. Only enforced when both the probe
+            # and the metadata give us real numbers; otherwise trust the file.
+            claimed = info.get("duration")
+            actual = probe_duration(filepath) if claimed else None
+            if claimed and actual and not _durations_match(actual, float(claimed)):
+                raise DownloadError(
+                    f"Duration mismatch: expected ~{int(claimed)}s, "
+                    f"got {int(actual)}s (likely truncated download). "
+                    f"File removed; try again."
+                )
     except Exception:
-        # Best-effort orphan sweep. If we knew the base up-front, use it.
-        # Otherwise, if yt-dlp got far enough to expose the reported path,
-        # use that stem — captured in a nested try so the raise isn't
-        # swallowed if info was never bound.
         if expected_base is not None:
             _cleanup_partials(expected_base.with_suffix(".mp3"))
         else:
@@ -360,8 +527,21 @@ def download_url(
                 _cleanup_partials(Path(reported).with_suffix(".mp3"))  # type: ignore[name-defined]
             except Exception:
                 pass
+        # If a truncated/mismatched mp3 already made it to disk, delete it so
+        # the next attempt doesn't trip the "already have it" skip.
+        try:
+            if filepath.exists():  # type: ignore[name-defined]
+                filepath.unlink()  # type: ignore[name-defined]
+        except (NameError, OSError):
+            pass
         raise
     else:
+        _mirror_copy(filepath, _primary_root())
+        try:
+            from . import state as _state  # late import to avoid cycle at module load
+            _state.record_download(filepath, info.get("duration"))
+        except Exception:  # noqa: BLE001
+            pass
         return DownloadResult(
             filepath=filepath,
             title=info.get("title") or filepath.stem,
@@ -423,6 +603,57 @@ def download_search(
         )
 
 
+def download_search_with_fallbacks(
+    artist: str | None,
+    title: str | None,
+    raw_text: str,
+    variant: str | None = None,
+    *,
+    dest_dir: Path,
+    playlist_index: int | None = None,
+    filename_hint: str | None = None,
+) -> DownloadResult:
+    """Try `download_search` with progressively looser variants of the query.
+
+    This is what the bot calls for each tracklist entry: if the exact
+    "Artist - Title (Remix) feat. X" string returns nothing, we retry with
+    the feat. stripped, then the parens stripped, then a flattened query,
+    then the raw tracklist line. The first success wins; if every variant
+    fails we raise the LAST error so the failure report has the most-
+    informative message.
+
+    Version qualifier matching stays enforced on every attempt — we never
+    silently fall back to "the original mix" when the user asked for a VIP.
+    """
+    from .tracklist import search_variants
+
+    errors: list[str] = []
+    variants = search_variants(artist, title, raw_text)
+    for i, (a, t) in enumerate(variants):
+        if a is None and t is None:
+            continue
+        try:
+            if i > 0:
+                attempt_desc = f"{a or '?'} - {t or '?'}"
+                log.info("fallback search variant %d: %s", i + 1, attempt_desc)
+            return download_search(
+                title=t,
+                artist=a,
+                variant=variant,
+                dest_dir=dest_dir,
+                playlist_index=playlist_index,
+                filename_hint=filename_hint,
+            )
+        except DownloadError as e:
+            errors.append(f"[variant {i + 1}: {a or '-'} / {t or '-'}] {e}")
+            continue
+    raise DownloadError(
+        "All search variants failed:\n  " + "\n  ".join(errors)
+        if errors
+        else "No searchable query from this entry."
+    )
+
+
 def extract_playlist_entries(url: str) -> tuple[str, list[dict]]:
     """Return (playlist_title, [entry_info,...]) without downloading."""
     with YoutubeDL(_probe_opts()) as ydl:
@@ -462,11 +693,25 @@ def download_playlist_entries(
     return results
 
 
-def get_video_metadata(url: str) -> dict:
-    """Return raw info dict for a URL (single video, no download)."""
+def get_video_metadata(url: str, *, with_comments: bool = False) -> dict:
+    """Return raw info dict for a URL (single video, no download).
+
+    When `with_comments=True`, also fetches top-level comments so pinned /
+    author-highlighted tracklist comments become visible to
+    parse_tracklist_from_info. Default off because comment extraction adds a
+    second round-trip and we only want it for likely DJ sets.
+    """
     opts = _probe_opts()
     opts.pop("extract_flat", None)
     opts["noplaylist"] = True
+    if with_comments:
+        opts["getcomments"] = True
+        opts["extractor_args"] = {
+            "youtube": {
+                "comment_sort": ["top"],
+                "max_comments": ["50", "all", "0", "0"],
+            }
+        }
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
         return info or {}

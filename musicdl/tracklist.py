@@ -60,8 +60,15 @@ _NOISE = re.compile(
 )
 
 # ---- Separators we consider between artist and title ----
+#
+# Order matters — most-specific first. A unicode em-dash should win over a
+# hyphen that also appears inside the title ("Fisher - Losing It - VIP Edit").
 
-_ARTIST_TITLE_SEPARATORS = (" - ", " – ", " — ")
+_ARTIST_TITLE_SEPARATORS = (
+    " - ", " – ", " — ", " ~ ", " | ",
+    # ascii "artist | title" and "artist :: title" variants seen in the wild
+    " :: ",
+)
 
 
 @dataclass
@@ -245,15 +252,129 @@ def parse_tracklist(text: str) -> list[TracklistEntry]:
     return []
 
 
+def _entries_from_chapters(info: dict) -> list[TracklistEntry]:
+    """YouTube chapter list → tracklist entries.
+
+    yt-dlp exposes chapters as [{"title": "Artist - Song", "start_time": 83.0}, ...].
+    These are the most reliable source when they're present — the uploader
+    structured them deliberately.
+    """
+    chapters = info.get("chapters") or []
+    out: list[TracklistEntry] = []
+    for i, c in enumerate(chapters, 1):
+        title = (c.get("title") or "").strip()
+        if not title:
+            continue
+        start = int(c.get("start_time") or 0)
+        ts = f"{start // 60:02d}:{start % 60:02d}" if start < 3600 else (
+            f"{start // 3600:d}:{(start % 3600) // 60:02d}:{start % 60:02d}"
+        )
+        artist, song = _split_artist_title(title)
+        out.append(
+            TracklistEntry(
+                index=i,
+                timestamp=ts,
+                seconds=start,
+                text=title,
+                artist=artist,
+                title=song,
+            )
+        )
+    # A single chapter is almost always "Intro" and not a tracklist.
+    return out if len(out) >= 2 else []
+
+
+def _pinned_first(comments: list[dict]) -> list[dict]:
+    """Return comments with pinned/highlighted ones first — DJ sets' tracklists
+    are usually pinned by the uploader when they're in a comment."""
+    pinned, rest = [], []
+    for c in comments:
+        if c.get("is_pinned") or c.get("is_favorited") or c.get("author_is_uploader"):
+            pinned.append(c)
+        else:
+            rest.append(c)
+    return pinned + rest
+
+
 def parse_tracklist_from_info(info: dict) -> list[TracklistEntry]:
-    """Try description first, then comments (if fetched)."""
+    """Try chapters first (highest signal), then description, then comments."""
+    chapter_entries = _entries_from_chapters(info)
+    if chapter_entries:
+        return chapter_entries
+
     description = info.get("description") or ""
     entries = parse_tracklist(description)
     if entries:
         return entries
-    for c in info.get("comments") or []:
+
+    for c in _pinned_first(info.get("comments") or []):
         body = c.get("text") or ""
         entries = parse_tracklist(body)
         if entries:
             return entries
     return []
+
+
+# ---- Search-variant fallbacks for stubborn tracks ----
+#
+# When a tracklist entry's primary query fails to find a download, we retry
+# with increasingly loose versions of the same query before giving up. Ordered
+# from "most faithful" to "last resort" — the caller stops as soon as one
+# succeeds, so the retained variant stays as close as possible to what the
+# user asked for.
+
+_PAREN = re.compile(r"\s*[\(\[][^)\]]*[\)\]]\s*")
+_FEAT = re.compile(r"\s*(?:feat\.?|ft\.?|featuring)\s+[^-–—()\[\]]+", re.IGNORECASE)
+_WITH = re.compile(r"\s*(?:with|w/|&|x|vs\.?)\s+[^-–—()\[\]]+", re.IGNORECASE)
+
+
+def search_variants(artist: str | None, title: str | None, text: str) -> list[tuple[str | None, str | None]]:
+    """Progressive fallbacks for a single track. Each item is (artist, title)
+    where either may be None (passed to download_search which also accepts
+    None/None + raw text via the caller's own fallback).
+
+    Example:
+      "Fisher", "Losing It (VIP Mix) feat. Someone"
+       → [
+            ("Fisher", "Losing It (VIP Mix) feat. Someone"),   # original
+            ("Fisher", "Losing It (VIP Mix)"),                  # drop feat.
+            ("Fisher", "Losing It"),                            # drop parens too
+            (None, "Fisher Losing It"),                         # flattened
+         ]
+
+    The caller invokes download_search once per tuple; the first success wins.
+    """
+    seen: set[tuple[str | None, str | None]] = set()
+    out: list[tuple[str | None, str | None]] = []
+
+    def add(a: str | None, t: str | None) -> None:
+        a_s = (a or "").strip() or None
+        t_s = (t or "").strip() or None
+        if not t_s and not a_s:
+            return
+        key = (a_s, t_s)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(key)
+
+    # 1. The original query.
+    add(artist, title)
+
+    # 2. Strip "feat. X" / "ft. X" from the title.
+    if title:
+        no_feat = _FEAT.sub("", title).strip()
+        add(artist, no_feat)
+        # 3. Strip "(…)" and "[…]" blocks entirely from the title.
+        no_paren = _PAREN.sub(" ", no_feat).strip()
+        add(artist, no_paren)
+        # 4. Try searching title + artist flattened (handles cases where the
+        #    artist field has multiple names joined with " & " / " x ").
+        if artist:
+            flat = f"{artist} {no_paren}".strip()
+            add(None, flat)
+    # 5. Last resort: use the raw tracklist line.
+    if text:
+        add(None, text)
+
+    return out

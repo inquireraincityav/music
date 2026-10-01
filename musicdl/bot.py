@@ -49,13 +49,16 @@ from telegram.ext import (
 from .downloader import (
     download_playlist_entries,
     download_search,
+    download_search_with_fallbacks,
     download_url,
     extract_playlist_entries,
     get_video_metadata,
     is_spotify_url,
 )
+from .notify import notify
 from .organizer import playlist_dir, set_dir, single_dir
 from .spotify import download_spotify
+from . import state as _state
 from .tracklist import parse_tracklist_from_info
 from .tracklist_web import discover_tracklist_from_web
 
@@ -256,6 +259,7 @@ async def _download_as_full_video(update, url: str) -> None:
     out = single_dir(None)
     result = await _run_in_thread(download_url, url, out, None, None)
     await _reply(update, f"Saved {result.filepath.name}")
+    notify("musicdl", f"Saved {result.filepath.name}")
 
 
 async def _handle_url(update, url: str, variant: str | None, force_full: bool = False) -> None:
@@ -286,6 +290,8 @@ async def _handle_url(update, url: str, variant: str | None, force_full: bool = 
             "to parse its tracklist. (Send `!full <url>` if you want the whole "
             "thing as one MP3 instead.)",
         )
+        # Re-probe with comments now that we've committed to set-parsing.
+        info = await _run_in_thread(get_video_metadata, url, with_comments=True)
         tracks, source = await _try_find_tracklist(update, info)
         if tracks:
             if source:
@@ -446,9 +452,10 @@ async def _download_tracks_with_progress(
         )
         try:
             await _run_in_thread(
-                download_search,
-                entry.title,
+                download_search_with_fallbacks,
                 entry.artist,
+                entry.title,
+                entry.text,
                 None,
                 dest_dir=out_dir,
                 playlist_index=entry.index,
@@ -463,6 +470,11 @@ async def _download_tracks_with_progress(
         final += f" · {len(failed)} failed (details below)"
     await edit(final, force=True)
     await _send_failure_report(update, failed)
+    notify(
+        "musicdl",
+        f"{label}: {ok}/{n} done"
+        + (f" ({len(failed)} failed)" if failed else ""),
+    )
 
 
 async def _handle_set(update, url: str) -> None:
@@ -473,7 +485,7 @@ async def _handle_set(update, url: str) -> None:
     """
     output = None
     await _reply(update, f"Parsing DJ set: {url}")
-    info = await _run_in_thread(get_video_metadata, url)
+    info = await _run_in_thread(get_video_metadata, url, with_comments=True)
     tracks, source = await _try_find_tracklist(update, info)
     if not tracks:
         source_line = f"\n\nSaw this URL but couldn't parse it: {source}" if source else ""
@@ -547,6 +559,25 @@ async def _handle_search(update, query: str, variant: str | None) -> None:
         filename_hint=None,
     )
     await _reply(update, f"Saved {result.filepath.name}")
+    notify("musicdl", f"Saved {result.filepath.name}")
+
+
+def _classify(text: str) -> tuple[str, str]:
+    """Return (kind, payload) for logging/queue purposes only."""
+    t = text.strip().lower()
+    if t.startswith("!set"):
+        return "set", text
+    if t.startswith("!playlist"):
+        return "playlist", text
+    if t.startswith("!full"):
+        return "full", text
+    if t.startswith("!tracklist"):
+        return "tracklist", text
+    if t.startswith("!search"):
+        return "search", text
+    if URL_RE.search(text):
+        return "url", text
+    return "search", text
 
 
 @restricted
@@ -559,6 +590,20 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_chat.send_action(ChatAction.TYPING)
 
     text, variant = _extract_variant(text)
+
+    # Persist the job before we start, so a crash mid-download leaves a
+    # breadcrumb (the user can see what was in flight after a restart).
+    kind, payload = _classify(text)
+    job = _state.enqueue(
+        kind,
+        payload,
+        extra={
+            "chat_id": update.effective_chat.id if update.effective_chat else None,
+            "user_id": update.effective_user.id if update.effective_user else None,
+            "variant": variant,
+        },
+    )
+    _state.mark_started(job.id)
 
     try:
         if text.lower().startswith("!set"):
@@ -625,6 +670,57 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception("Handler failed")
         await _reply(update, f"Error: {e!r}")
+    finally:
+        _state.mark_done(job.id)
+
+
+async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/queue` → list pending/crashed-mid-flight jobs; `/queue clear` nukes them."""
+    args = context.args or []
+    if args and args[0] == "clear":
+        n = _state.clear_queue()
+        await _reply(update, f"Cleared {n} queued job(s).")
+        return
+    pending = _state.peek_pending()
+    if not pending:
+        await _reply(update, "Queue empty.")
+        return
+    lines = [f"{len(pending)} job(s) pending (unfinished across restarts):"]
+    for j in pending[:30]:
+        age = int(time.time() - j.enqueued_at)
+        lines.append(f"  [{j.kind}] attempts={j.attempts} age={age}s  {j.payload[:80]}")
+    if len(pending) > 30:
+        lines.append(f"  …and {len(pending) - 30} more")
+    lines.append("")
+    lines.append("Resend what you still want; `/queue clear` to drop them all.")
+    await _reply(update, "\n".join(lines))
+
+
+async def _announce_pending_on_startup(app: Application) -> None:
+    """If any jobs are in the queue from a prior session, DM the first
+    allowed user so they know work was interrupted."""
+    pending = _state.peek_pending()
+    if not pending:
+        return
+    allowed = sorted(ALLOWED_USER_IDS)
+    if not allowed:
+        return
+    target = allowed[0]
+    lines = [
+        f"⚠️ Bot restarted with {len(pending)} unfinished job(s) in the queue:",
+        "",
+    ]
+    for j in pending[:10]:
+        lines.append(f"  • [{j.kind}] {j.payload[:90]}")
+    if len(pending) > 10:
+        lines.append(f"  …and {len(pending) - 10} more")
+    lines.append("")
+    lines.append("These were interrupted mid-download. Resend what you still "
+                 "want, or send `/queue clear` to drop them.")
+    try:
+        await app.bot.send_message(chat_id=target, text="\n".join(lines))
+    except Exception as e:  # noqa: BLE001
+        log.warning("couldn't DM queue warning to %s: %s", target, e)
 
 
 def build_app() -> Application:
@@ -637,13 +733,14 @@ def build_app() -> Application:
             "user id (see /whoami on any Telegram id bot) as a comma-separated "
             "list; the bot ignores everyone else."
         )
-    app = Application.builder().token(token).build()
+    app = Application.builder().post_init(_announce_pending_on_startup).token(token).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("git", cmd_git))
     app.add_handler(CommandHandler("shell", cmd_shell))
     app.add_handler(CommandHandler("restart", cmd_restart))
+    app.add_handler(CommandHandler("queue", cmd_queue))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     return app
 

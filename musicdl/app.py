@@ -28,6 +28,7 @@ from .app_config import (
     load_config,
     save_config,
 )
+from .autostart import launch_at_login_enabled, set_launch_at_login
 
 log = logging.getLogger("musicdl.app")
 
@@ -94,12 +95,33 @@ class SettingsDialog(tk.Toplevel):
         ttk.Entry(ck_row, textvariable=self.ck_var, width=42).pack(side="left", fill="x", expand=True)
         ttk.Button(ck_row, text="Choose…", command=self._pick_cookies).pack(side="left", padx=(6, 0))
 
+        ttk.Label(frame, text="Mirror folder(s) (optional)\n(one per line — e.g. iCloud path)").grid(
+            row=4, column=0, sticky="nw", **pad
+        )
+        self.mirrors_text = tk.Text(frame, width=52, height=3)
+        self.mirrors_text.insert("1.0", "\n".join(cfg.mirror_dirs))
+        self.mirrors_text.grid(row=4, column=1, sticky="ew", **pad)
+
         self.autostart_var = tk.BooleanVar(value=cfg.auto_start_bot)
         ttk.Checkbutton(
             frame,
             text="Start the bot automatically when this app opens",
             variable=self.autostart_var,
-        ).grid(row=4, column=0, columnspan=2, sticky="w", **pad)
+        ).grid(row=5, column=0, columnspan=2, sticky="w", **pad)
+
+        self.notify_var = tk.BooleanVar(value=cfg.notifications_enabled)
+        ttk.Checkbutton(
+            frame,
+            text="Show a desktop notification when a download finishes",
+            variable=self.notify_var,
+        ).grid(row=6, column=0, columnspan=2, sticky="w", **pad)
+
+        self.login_var = tk.BooleanVar(value=cfg.launch_at_login or launch_at_login_enabled())
+        ttk.Checkbutton(
+            frame,
+            text="Launch this app automatically when I log into this computer",
+            variable=self.login_var,
+        ).grid(row=7, column=0, columnspan=2, sticky="w", **pad)
 
         btns = ttk.Frame(self)
         btns.pack(fill="x", padx=12, pady=(0, 12))
@@ -139,13 +161,30 @@ class SettingsDialog(tk.Toplevel):
                     parent=self,
                 )
                 return
+        mirror_lines = [
+            ln.strip()
+            for ln in self.mirrors_text.get("1.0", "end").splitlines()
+            if ln.strip()
+        ]
         cfg = AppConfig(
             telegram_bot_token=self.token_var.get().strip(),
             telegram_allowed_user_ids=ids,
             output_dir=self.out_var.get().strip(),
             cookies_file=self.ck_var.get().strip(),
             auto_start_bot=self.autostart_var.get(),
+            mirror_dirs=mirror_lines,
+            notifications_enabled=self.notify_var.get(),
+            launch_at_login=self.login_var.get(),
         )
+        # Apply the launch-at-login OS change immediately so it reflects what
+        # the UI shows. Failure is reported but doesn't abort the save.
+        ok, msg = set_launch_at_login(cfg.launch_at_login)
+        if not ok:
+            messagebox.showwarning(
+                APP_TITLE,
+                f"Couldn't update launch-at-login setting: {msg}",
+                parent=self,
+            )
         save_config(cfg)
         self.result = cfg
         self.destroy()

@@ -49,6 +49,10 @@ class AppConfig:
     output_dir: str = ""  # empty means "use default_output_dir()"
     cookies_file: str = ""  # empty means none
     auto_start_bot: bool = True
+    # NEW — Tier 1/2 features
+    mirror_dirs: list[str] = field(default_factory=list)   # extra output roots
+    notifications_enabled: bool = True                     # OS toasts on finish
+    launch_at_login: bool = False                          # install LaunchAgent / registry run key
 
     def is_ready(self) -> bool:
         """True if config is complete enough to start the bot."""
@@ -65,9 +69,12 @@ class AppConfig:
                 str(uid) for uid in self.telegram_allowed_user_ids
             ),
             "MUSICDL_OUTPUT_DIR": str(self.effective_output_dir()),
+            "MUSICDL_NOTIFY_ENABLED": "1" if self.notifications_enabled else "0",
         }
         if self.cookies_file:
             env["MUSICDL_COOKIES_FILE"] = self.cookies_file
+        if self.mirror_dirs:
+            env["MUSICDL_MIRROR_DIRS"] = os.pathsep.join(self.mirror_dirs)
         return env
 
 
@@ -89,12 +96,19 @@ def load_config() -> AppConfig:
             normalized_ids.append(int(uid))
         except (TypeError, ValueError):
             continue
+    mirrors = raw.get("mirror_dirs") or []
+    if isinstance(mirrors, str):
+        mirrors = [p.strip() for p in mirrors.split(",") if p.strip()]
+    normalized_mirrors = [str(p) for p in mirrors if str(p).strip()]
     return AppConfig(
         telegram_bot_token=str(raw.get("telegram_bot_token") or ""),
         telegram_allowed_user_ids=normalized_ids,
         output_dir=str(raw.get("output_dir") or ""),
         cookies_file=str(raw.get("cookies_file") or ""),
         auto_start_bot=bool(raw.get("auto_start_bot", True)),
+        mirror_dirs=normalized_mirrors,
+        notifications_enabled=bool(raw.get("notifications_enabled", True)),
+        launch_at_login=bool(raw.get("launch_at_login", False)),
     )
 
 
