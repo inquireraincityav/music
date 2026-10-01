@@ -244,26 +244,74 @@ def _rename_to_preferred(
     return target
 
 
+def _resolve_artist_from_info(info: dict) -> str:
+    """Pull the best available artist name from yt-dlp metadata.
+
+    Preference, each stripped of trailing " - Topic" / " VEVO" / " - Official":
+      1. `artist` (set by music-aware extractors; sometimes multi-value "A, B")
+      2. `creator`
+      3. `uploader` / `channel`  (channel-name fallback — "<Artist> - Topic"
+         on YouTube Music auto-generated channels is the actual artist name)
+    """
+    for key in ("artist", "creator", "uploader", "channel"):
+        val = (info.get(key) or "").strip()
+        if not val:
+            continue
+        for suffix in (" - Topic", " VEVO", "VEVO", " - Official", " Official"):
+            if val.endswith(suffix):
+                val = val[: -len(suffix)].strip()
+        if val:
+            return val
+    return ""
+
+
+def _resolve_track_from_info(info: dict) -> str:
+    """Pull the best available song title from yt-dlp metadata."""
+    for key in ("track", "title"):
+        val = (info.get(key) or "").strip()
+        if val:
+            return val
+    return ""
+
+
+def _preserve_version_qualifier(hint_title: str, canonical_track: str) -> str:
+    """If the tracklist hint had a (VIP Mix)/(Edit)/etc. qualifier that
+    yt-dlp's bare `track` field doesn't carry, append it so Serato keeps
+    the version distinction. Returns the canonical track augmented."""
+    if not hint_title or not canonical_track:
+        return canonical_track
+    # Find the FIRST paren block in the hint that contains a version keyword.
+    for m in _PAREN_CONTENT.finditer(hint_title):
+        block = m.group(1).strip()
+        if not _VERSION_KEYWORDS.search(block):
+            continue
+        # Already in the canonical track? Then nothing to add.
+        if block.lower() in canonical_track.lower():
+            return canonical_track
+        return f"{canonical_track} ({block})"
+    return canonical_track
+
+
 def _enforce_title_artist_order(
     mp3: Path,
     info: dict,
     playlist_index: Optional[int],
 ) -> Path:
-    """If the current filename's two sides are swapped relative to yt-dlp's
-    metadata (artist on the LEFT, title on the RIGHT), flip it so title
-    comes first.
+    """Rebuild the filename as 'Title - Artist' from yt-dlp metadata when
+    metadata is available. Ground-truth wins over whatever ordering the
+    tracklist entry supplied, so the result is airtight regardless of how
+    the uploader wrote the description.
 
-    Uses fuzzy substring containment rather than exact string match: the
-    tracklist entry may add 'ft. X' or '(VIP Mix)' qualifiers that yt-dlp's
-    bare `track`/`artist` fields don't carry, and vice-versa — we just need
-    to know which SIDE of the ' - ' is which. No-op when metadata is
-    missing (nothing to compare against).
+    Preserves any version qualifier that was in the original hint title
+    (e.g. "(VIP Mix)", "(Dan Bravo Edit)") but missing from yt-dlp's
+    bare `track` field — Serato needs those to distinguish versions.
+
+    No-op when metadata is truly empty — we literally can't tell which
+    side is which; the hint-derived name is the best guess we have.
     """
-    track = (info.get("track") or "").strip()
-    artist = (info.get("artist") or info.get("creator") or "").strip()
-    if artist.endswith(" - Topic"):
-        artist = artist[: -len(" - Topic")].strip()
-    if not track or not artist:
+    canonical_track = _resolve_track_from_info(info)
+    canonical_artist = _resolve_artist_from_info(info)
+    if not canonical_track or not canonical_artist:
         return mp3
 
     stem = mp3.stem
@@ -271,41 +319,25 @@ def _enforce_title_artist_order(
     prefix = m.group(1) if m else ""
     core = m.group(2) if m else stem
 
-    if " - " not in core:
-        return mp3
+    # The hint's "title" side is whatever is NOT the canonical artist — try
+    # to find it so we can preserve version qualifiers.
+    hint_title = core
+    if " - " in core and canonical_artist.lower() in core.lower():
+        left, _, right = core.partition(" - ")
+        hint_title = right if canonical_artist.lower() in left.lower() else left
 
-    # Split at FIRST ' - ' (what safe_filename and our hint builder use).
-    left, _, right = core.partition(" - ")
-
-    # Use the first "significant" word of each metadata field for matching —
-    # cheaper than full containment and more forgiving when the entry has
-    # extra ft./featuring/version chatter.
-    def contains(hay: str, needle: str) -> bool:
-        if not needle:
-            return False
-        return needle.lower() in hay.lower()
-
-    left_has_artist = contains(left, artist)
-    right_has_artist = contains(right, artist)
-    left_has_track = contains(left, track)
-    right_has_track = contains(right, track)
-
-    # Currently Artist-Title: artist on left, track on right, unambiguous.
-    is_artist_title = (
-        left_has_artist
-        and right_has_track
-        and not (right_has_artist and left_has_track)
-    )
-    if not is_artist_title:
-        return mp3
-
-    new_core = f"{right} - {left}"
+    full_title = _preserve_version_qualifier(hint_title, canonical_track)
+    new_core = f"{full_title} - {canonical_artist}"
     target = mp3.with_name(f"{prefix}{safe_filename(new_core)}.mp3")
-    if target == mp3 or target.exists():
+    if target == mp3:
+        return mp3
+    if target.exists() and target != mp3:
+        # Another download already produced this exact file — leave current
+        # one and move on (dedup is handled elsewhere).
         return mp3
     try:
         mp3.rename(target)
-        log.info("flipped to Title-Artist order: %r -> %r", mp3.name, target.name)
+        log.info("ground-truth rename: %r -> %r", mp3.name, target.name)
         return target
     except OSError:
         return mp3
