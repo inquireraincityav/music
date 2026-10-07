@@ -377,6 +377,24 @@ Files are encoded to a configuration DJ software is happiest reading:
 If an older download looks wrong in Serato, delete the per-track `.serato`
 sidecar folder and re-add it so Serato re-analyzes with the new headers.
 
+### Fixing existing files without re-downloading
+
+Run `musicdl-retag` to rewrite every MP3 under your output folder with the
+Serato-friendly ID3v2.3 tags and Xing header. Audio is **stream-copied**
+(no re-encode, no quality loss), so this is fast and safe.
+
+```bash
+musicdl-retag                 # walk the default output folder
+musicdl-retag --dir /path     # a different folder
+musicdl-retag --delete-serato # also clear .serato sidecars so Serato re-analyzes
+musicdl-retag --dry-run       # report-only, no changes
+```
+
+The one thing re-tagging can't fix is sample rate (that was baked in at
+encode time). To get 44.1 kHz on an older file you'd need to re-download
+it; `/queue clear` lets you force a re-download if `musicdl` would
+otherwise skip it as "already have".
+
 ## Notes
 
 - The 320 kbps figure is the **MP3 encode bitrate**. Real audio fidelity is

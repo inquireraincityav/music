@@ -25,6 +25,7 @@ browser = [
 musicdl = "musicdl.cli:main"
 musicdl-bot = "musicdl.bot:main"
 musicdl-app = "musicdl.app:main"
+musicdl-retag = "musicdl.retag:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
