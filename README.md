@@ -384,11 +384,20 @@ Serato-friendly ID3v2.3 tags and Xing header. Audio is **stream-copied**
 (no re-encode, no quality loss), so this is fast and safe.
 
 ```bash
-musicdl-retag                 # walk the default output folder
-musicdl-retag --dir /path     # a different folder
-musicdl-retag --delete-serato # also clear .serato sidecars so Serato re-analyzes
-musicdl-retag --dry-run       # report-only, no changes
+musicdl-retag                       # walk the default output folder
+musicdl-retag --dir /path           # a different folder
+musicdl-retag --serato-crates       # retag only the files referenced by your Serato crates
+musicdl-retag --serato-crates "Hip Hop,Bangers"
+                                    # limit to specific crate names
+musicdl-retag --delete-serato       # also clear .serato sidecars so Serato re-analyzes
+musicdl-retag --dry-run             # report-only, no changes
 ```
+
+`--serato-crates` scans `~/Music/_Serato_/Subcrates/*.crate` (and
+`/Volumes/*/_Serato_/Subcrates/*.crate` for external drives), reads each
+crate's track list, and retags just those files — handy when your library
+lives in a folder other than `MusicDownloads` and you want Serato's own
+crate contents fixed rather than a disk sweep.
 
 The one thing re-tagging can't fix is sample rate (that was baked in at
 encode time). To get 44.1 kHz on an older file you'd need to re-download
