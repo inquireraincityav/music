@@ -355,6 +355,28 @@ native OS toast (macOS Notification Center, Windows toast, Linux
 with your OS to start when you log in (LaunchAgent on Mac, HKCU Run key on
 Windows, `~/.config/autostart` on Linux). No `launchd` plist editing.
 
+## Serato / Rekordbox / Traktor compatibility
+
+Files are encoded to a configuration DJ software is happiest reading:
+
+- **MP3 CBR 320 kbps** via libmp3lame (yt-dlp's `FFmpegExtractAudio` with
+  `preferredquality=320`).
+- **44.1 kHz / stereo**. YouTube serves 48 kHz for a lot of streams; we
+  resample at encode time so the file is already at the sample rate Serato
+  wants, no runtime SRC pass needed for analysis.
+- **ID3v2.3 tags** (not v2.4). Serato reads v2.3 reliably; v2.4 sometimes
+  returns empty, which triggers a slow re-analyze that itself can leave the
+  overview waveform looking flat.
+- **Xing/Info header forced on**, so the player has an accurate frame count
+  up-front and the overview waveform aligns with the audio.
+- **Source format preference**: `m4a/AAC → MP3 → anything else`, in that
+  order. YouTube's AAC streams transcode to MP3 much more cleanly than its
+  Opus/WebM streams, which was the main reason waveforms used to look
+  flatter in Serato than files downloaded directly from a browser.
+
+If an older download looks wrong in Serato, delete the per-track `.serato`
+sidecar folder and re-add it so Serato re-analyzes with the new headers.
+
 ## Notes
 
 - The 320 kbps figure is the **MP3 encode bitrate**. Real audio fidelity is

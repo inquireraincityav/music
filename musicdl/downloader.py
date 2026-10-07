@@ -124,13 +124,24 @@ def _base_opts(
     progress_hook: Optional[Callable[[dict], None]] = None,
 ) -> dict:
     opts: dict = {
-        "format": "bestaudio/best",
+        # Format priority tuned for Serato waveform fidelity:
+        #   1. m4a/AAC — transcodes to MP3 much more cleanly than Opus (fewer
+        #      frame-boundary artefacts, no sample-rate conversion gymnastics).
+        #   2. Any format at ≤48kHz sample rate so we don't resample from
+        #      exotic rates.
+        #   3. Finally, best audio of anything available.
+        # The user's previous "bestaudio/best" was returning Opus/WebM
+        # often, which Serato's analyzer renders with flatter waveforms.
+        "format": (
+            "bestaudio[ext=m4a]/bestaudio[acodec=aac]/"
+            "bestaudio[ext=mp3]/bestaudio[asr<=48000]/bestaudio/best"
+        ),
         "outtmpl": output_template,
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": "mp3",
-                "preferredquality": MP3_BITRATE,
+                "preferredquality": MP3_BITRATE,  # "320" → libmp3lame -b:a 320k
             },
             {
                 "key": "FFmpegMetadata",
@@ -141,6 +152,30 @@ def _base_opts(
                 "already_have_thumbnail": False,
             },
         ],
+        # Pass through to the extract-audio ffmpeg invocation. These are the
+        # knobs Serato (and Rekordbox, Traktor) look at when rendering a
+        # waveform from a freshly-added file:
+        #   -id3v2_version 3   — Serato strongly prefers ID3v2.3 over v2.4;
+        #                        v2.4 tags are sometimes read as empty, which
+        #                        then triggers a slow re-analyze that itself
+        #                        can produce the odd flattened waveform.
+        #   -write_xing 1      — forces a Xing/Info header even on CBR, giving
+        #                        Serato an accurate frame count up-front so the
+        #                        overview waveform aligns with the actual audio.
+        #   -ar 44100          — resample everything to 44.1 kHz. YouTube
+        #                        serves 48 kHz for a lot of streams; Serato is
+        #                        happier with 44.1 and this avoids the SRC
+        #                        pass happening at analyze time.
+        #   -ac 2              — force stereo (some Opus streams decode as 1ch
+        #                        and show as half-height mono waveforms).
+        "postprocessor_args": {
+            "ffmpegextractaudio": [
+                "-id3v2_version", "3",
+                "-write_xing", "1",
+                "-ar", "44100",
+                "-ac", "2",
+            ],
+        },
         "writethumbnail": True,
         "quiet": False,
         "no_warnings": False,
