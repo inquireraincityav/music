@@ -92,6 +92,7 @@ def clean_existing_name(mp3: Path, dry_run: bool = False) -> tuple[Path, str]:
     tag_artist, tag_title = _read_id3_artist_title(mp3)
 
     new_core: str
+    rebuilt_from = ""
     if tag_artist and tag_title and len(tag_artist) >= 2:
         # Rebuild from ID3 tags. Preserve any version qualifier from the
         # current filename that the bare TIT2 might not carry.
@@ -100,8 +101,6 @@ def clean_existing_name(mp3: Path, dry_run: bool = False) -> tuple[Path, str]:
         if " - " in core and tag_artist_lo in core.lower():
             left, _, right = core.partition(" - ")
             title_from_name = right if tag_artist_lo in left.lower() else left
-        # Pull the (Remix) / (VIP Mix) qualifier out of the name-derived
-        # title if TIT2 doesn't already have it.
         _, version_block = _detach_version_from_artist(title_from_name)
         full_title = clean_title_noise(tag_title)
         if version_block and version_block.lower() not in full_title.lower():
@@ -109,9 +108,24 @@ def clean_existing_name(mp3: Path, dry_run: bool = False) -> tuple[Path, str]:
         full_title = clean_title_noise(full_title)
         clean_artist = clean_title_noise(tag_artist)
         new_core = f"{full_title} - {clean_artist}"
+        rebuilt_from = "id3-tags"
     else:
-        # No reliable tags — fall back to stem noise cleaning only.
+        # No reliable ID3 tags. Try: if left side of filename has a
+        # version qualifier and right side doesn't, assume uploader
+        # mis-attached version to artist — flip and detach.
         new_core = clean_title_noise(core)
+        if " - " in core:
+            from .downloader import _VERSION_PAREN_RE
+            left, _, right = core.partition(" - ")
+            if _VERSION_PAREN_RE.search(left) and not _VERSION_PAREN_RE.search(right):
+                artist_clean, version_block = _detach_version_from_artist(left)
+                title_side = right.strip()
+                if version_block and version_block.lower() not in title_side.lower():
+                    title_side = f"{title_side} {version_block}".strip()
+                title_side = clean_title_noise(title_side)
+                artist_clean = clean_title_noise(artist_clean)
+                new_core = f"{title_side} - {artist_clean}"
+                rebuilt_from = "version-detach"
 
     if not new_core or new_core == core:
         return mp3, "no change"

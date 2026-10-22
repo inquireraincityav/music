@@ -184,18 +184,28 @@ def _split_artist_title(text: str) -> tuple[str | None, str | None]:
     right_title_sig = bool(_TITLE_SIGNAL_PARENS.search(right))
 
     # 1. Features/collaborators point unambiguously at the artist side.
+    #    This is the strongest signal: "feat.", "ft.", "&", "vs." never
+    #    attach to a song title.
     if left_artist_sig and not right_artist_sig:
         return left, right        # left is artist
     if right_artist_sig and not left_artist_sig:
         return right, left        # right is artist → swap
 
-    # 2. Version qualifier parens point unambiguously at the title side.
-    if left_title_sig and not right_title_sig:
-        return right, left        # left is title → swap
-    if right_title_sig and not left_title_sig:
-        return left, right        # right is title → default order
+    # 2. Version-qualifier parens are WEAKER — DJs frequently attach them
+    #    to the artist name by mistake, e.g. "Prospa (Extended Mix) - Dreams"
+    #    where Prospa is the artist. We only trust the version-side-is-title
+    #    reading when the OTHER side has corroborating artist signals
+    #    (short, feature-marked, or long comma-separated name list).
+    #    Otherwise the parser-time guess is left=artist, and post-download
+    #    enforcement detaches the mis-attached version qualifier.
+    if left_title_sig and not right_title_sig and right_artist_sig:
+        return right, left        # left is title → swap (version AND artist signal confirm)
+    if right_title_sig and not left_title_sig and left_artist_sig:
+        return left, right        # right is title → default order (confirmed)
 
-    # 3. No signals (or signals on both sides): default to Artist - Title.
+    # 3. Default: left is artist, right is title. Post-download enforcement
+    #    (uploader-match + version-detach) corrects when yt-dlp metadata
+    #    says otherwise.
     return left, right
 
 

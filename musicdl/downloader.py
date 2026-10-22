@@ -567,7 +567,30 @@ def _enforce_title_artist_order(
                 # noise if the hint had any.
                 break
 
-    # ---- Path C: just clean noise.
+    # ---- Path C-prime: no uploader match, but the LEFT side carries a
+    # version qualifier like "(Extended Mix)" / "(Dj Edit)" and the RIGHT
+    # side doesn't. This is the "DJ attached the version to the artist
+    # name" convention — assume left=artist with mis-attached version,
+    # detach it, flip to Title-Artist. Preserves the version by moving
+    # it to the title where it belongs.
+    if " - " in core:
+        left, _, right = core.partition(" - ")
+        left_has_version = bool(_VERSION_PAREN_RE.search(left))
+        right_has_version = bool(_VERSION_PAREN_RE.search(right))
+        if left_has_version and not right_has_version:
+            artist_clean, version_block = _detach_version_from_artist(left)
+            title_side = right.strip()
+            if version_block and version_block.lower() not in title_side.lower():
+                title_side = f"{title_side} {version_block}".strip()
+            title_side = clean_title_noise(title_side)
+            artist_clean = clean_title_noise(artist_clean)
+            new_core = _strip_duplicate_artist(
+                f"{title_side} - {artist_clean}", artist_clean
+            )
+            if new_core != core:
+                return _apply_rename(new_core, "version-detach")
+
+    # ---- Path D: just clean noise.
     cleaned = clean_title_noise(core)
     if cleaned == core:
         return mp3
