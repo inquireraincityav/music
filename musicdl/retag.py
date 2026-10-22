@@ -46,22 +46,76 @@ def _ffmpeg_binary() -> str:
     return shutil.which("ffmpeg") or "ffmpeg"
 
 
+def _read_id3_artist_title(mp3: Path) -> tuple[str, str]:
+    """Return (artist, title) from the file's embedded ID3 tags, or ('', '')
+    if either is missing or unreadable. Uses mutagen (already a dep)."""
+    try:
+        from mutagen.id3 import ID3
+    except Exception:
+        return "", ""
+    try:
+        tags = ID3(str(mp3))
+    except Exception:
+        return "", ""
+    def _get(frame_id: str) -> str:
+        try:
+            frame = tags.get(frame_id)
+            if not frame:
+                return ""
+            val = frame.text[0] if frame.text else ""
+            return str(val).strip()
+        except Exception:
+            return ""
+    return _get("TPE1"), _get("TIT2")
+
+
 def clean_existing_name(mp3: Path, dry_run: bool = False) -> tuple[Path, str]:
-    """Rename a file to strip title noise ('(Official Audio)', dates, bullet
-    symbols, '- Visualiser', etc.). Preserves any 'NN - ' playlist prefix.
-    Returns (new_path_or_original, message).
+    """Rename a file to clean noise AND fix order using its embedded ID3 tags.
+
+    Logic:
+      1. Read TPE1 (artist) + TIT2 (title) from the file.
+      2. If both are present, rebuild as 'cleaned_title - cleaned_artist',
+         re-attaching the current filename's version qualifier (which may be
+         richer than TIT2 — tracklists often add '(VIP Mix)' etc.).
+      3. If tags are missing, fall back to cleaning noise from the stem only.
+
+    Preserves the 'NN - ' playlist prefix. Returns (new_path, message).
     """
     import re
-    from .downloader import clean_title_noise
+    from .downloader import clean_title_noise, _detach_version_from_artist
 
     stem = mp3.stem
     m = re.match(r"^(\d{2,3}\s*[-\.]\s*)(.+)$", stem)
     prefix = m.group(1) if m else ""
     core = m.group(2) if m else stem
-    cleaned = clean_title_noise(core)
-    if not cleaned or cleaned == core:
+
+    tag_artist, tag_title = _read_id3_artist_title(mp3)
+
+    new_core: str
+    if tag_artist and tag_title and len(tag_artist) >= 2:
+        # Rebuild from ID3 tags. Preserve any version qualifier from the
+        # current filename that the bare TIT2 might not carry.
+        title_from_name = core
+        tag_artist_lo = tag_artist.lower()
+        if " - " in core and tag_artist_lo in core.lower():
+            left, _, right = core.partition(" - ")
+            title_from_name = right if tag_artist_lo in left.lower() else left
+        # Pull the (Remix) / (VIP Mix) qualifier out of the name-derived
+        # title if TIT2 doesn't already have it.
+        _, version_block = _detach_version_from_artist(title_from_name)
+        full_title = clean_title_noise(tag_title)
+        if version_block and version_block.lower() not in full_title.lower():
+            full_title = f"{full_title} {version_block}".strip()
+        full_title = clean_title_noise(full_title)
+        clean_artist = clean_title_noise(tag_artist)
+        new_core = f"{full_title} - {clean_artist}"
+    else:
+        # No reliable tags — fall back to stem noise cleaning only.
+        new_core = clean_title_noise(core)
+
+    if not new_core or new_core == core:
         return mp3, "no change"
-    new_name = f"{prefix}{cleaned}.mp3"
+    new_name = f"{prefix}{new_core}.mp3"
     target = mp3.with_name(new_name)
     if target == mp3:
         return mp3, "no change"
@@ -71,6 +125,16 @@ def clean_existing_name(mp3: Path, dry_run: bool = False) -> tuple[Path, str]:
         return target, f"would rename -> {new_name}"
     try:
         mp3.rename(target)
+        # Sweep sidecar thumbnails (.png / .webp / .jpg) with the OLD stem.
+        import glob as _glob
+        pattern = _glob.escape(stem) + ".*"
+        for f in mp3.parent.glob(pattern):
+            if f.suffix.lower() == ".mp3":
+                continue
+            try:
+                f.unlink()
+            except OSError:
+                pass
         return target, f"renamed -> {new_name}"
     except OSError as e:
         return mp3, f"rename failed: {e}"

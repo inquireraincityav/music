@@ -434,23 +434,71 @@ def _strip_duplicate_artist(core: str, artist: str) -> str:
     return core
 
 
+def _all_artist_candidates(info: dict) -> list[str]:
+    """Every string that could plausibly identify the real artist, in order
+    of trustworthiness. Includes raw uploader/channel even without a
+    '- Topic' / VEVO suffix — used for FUZZY MATCH against the hint sides
+    to decide which half of 'A - B' is the artist. We don't use these
+    looser candidates as the final rename artist (that still goes through
+    the strict resolver); only to tiebreak order."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for key in ("artist", "creator", "uploader", "channel"):
+        v = (info.get(key) or "").strip()
+        if not v:
+            continue
+        for suffix in (" - Topic", " VEVO", "VEVO", " - Official", " Official"):
+            if v.endswith(suffix):
+                v = v[: -len(suffix)].strip()
+        if v and v.lower() not in seen:
+            seen.add(v.lower())
+            out.append(v)
+    return out
+
+
+# Paren/bracket block containing a version keyword (Remix/Edit/VIP Mix/etc).
+# Local copy of tracklist.py's _TITLE_SIGNAL_PARENS so we don't need the
+# cross-module import (tracklist.py already lazy-imports from this module).
+_VERSION_PAREN_RE = re.compile(
+    r"[\(\[][^)\]]*\b(?:remix|mix|edit|bootleg|mashup|version|rework|rmx|"
+    r"vip|dub|extended|club|radio|instrumental|acapella|flip|refix|tweak|"
+    r"dirty|clean|short|long|intro|outro|drum|chop|chopped|screwed|slowed|"
+    r"sped\s*up|blend|dj\s*edit)\b[^)\]]*[\)\]]",
+    re.IGNORECASE,
+)
+
+
+def _detach_version_from_artist(artist_side: str) -> tuple[str, Optional[str]]:
+    """If the "artist" side of a hint carries a trailing version qualifier
+    like '(Dj Edit)' or '(Extended Mix)' (uploader attached it to the wrong
+    name), peel it off so we can reattach it to the title.
+
+    Returns (artist_without_version, version_block_or_None).
+    """
+    m = _VERSION_PAREN_RE.search(artist_side)
+    if not m:
+        return artist_side, None
+    block = m.group(0)
+    cleaned = (artist_side[: m.start()] + artist_side[m.end():]).strip()
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).rstrip(" -–—")
+    return cleaned or artist_side, block
+
+
 def _enforce_title_artist_order(
     mp3: Path,
     info: dict,
     playlist_index: Optional[int],
 ) -> Path:
-    """Final filename shaping. Two paths:
+    """Final filename shaping. Priority ladder:
 
-    A. RELIABLE metadata (yt-dlp gave us a real `track` AND a reliable
-       `artist` — either the proper tag or a '- Topic' / VEVO channel) →
-       rebuild as 'cleaned-title - canonical-artist', preserving any
-       (Remix) / (VIP Mix) qualifier from the hint. Ground truth wins.
-
-    B. WEAK or missing metadata (uploader is a generic curator channel
-       like "Future House Music"; `track` is empty) → DON'T use the
-       channel name as the artist (that produced the duplicated-name
-       mess). Keep the hint's artist/title ordering but strip noise
-       from the title ((Official Audio), dates, bullets, etc.).
+    A. RELIABLE metadata (both `track` and strict `artist` from yt-dlp) →
+       rebuild from ground truth, preserve the hint's version qualifier.
+    B. UPLOADER MATCH — the strict resolver was empty but yt-dlp gave us
+       SOME artist candidate (channel name, creator, etc.) that fuzzy-
+       matches one side of the hint. Use that match to decide which side
+       is really the artist, flip to Title-Artist, AND detach any (Dj Edit)
+       -style qualifier that was mis-attached to the artist half.
+    C. NO SIGNAL — clean noise from the hint-derived name in place.
     """
     canonical_track = _resolve_track_from_info(info)
     canonical_artist = _resolve_artist_from_info(info)
@@ -460,46 +508,70 @@ def _enforce_title_artist_order(
     prefix = m.group(1) if m else ""
     core = m.group(2) if m else stem
 
-    # ---- Path B: no reliable metadata, just clean noise in-place.
-    if not canonical_track or not canonical_artist:
-        cleaned = clean_title_noise(core)
-        if cleaned == core:
-            return mp3
-        target = mp3.with_name(f"{prefix}{safe_filename(cleaned)}.mp3")
+    def _apply_rename(new_core: str, source_tag: str) -> Path:
+        target = mp3.with_name(f"{prefix}{safe_filename(new_core)}.mp3")
         if target == mp3 or target.exists():
             return mp3
         try:
             mp3.rename(target)
-            log.info("cleaned title noise: %r -> %r", mp3.name, target.name)
+            log.info("%s rename: %r -> %r", source_tag, mp3.name, target.name)
+            # Sweep orphan sidecars (.png / .webp / .jpg) whose stem matches
+            # the file's OLD name — enforcement runs after _cleanup_partials
+            # so these would otherwise stick around.
+            _cleanup_partials(mp3.with_suffix(".mp3"))
+            _cleanup_partials(target)
             return target
         except OSError:
             return mp3
 
-    # ---- Path A: rebuild from canonical metadata.
-    # Find the hint-side that is NOT the artist, so we can carry its version
-    # qualifier through into the final filename.
-    hint_title = core
-    if " - " in core and canonical_artist.lower() in core.lower():
+    # ---- Path A: full ground-truth rebuild.
+    if canonical_track and canonical_artist:
+        hint_title = core
+        if " - " in core and canonical_artist.lower() in core.lower():
+            left, _, right = core.partition(" - ")
+            hint_title = right if canonical_artist.lower() in left.lower() else left
+        full_title = _preserve_version_qualifier(hint_title, canonical_track)
+        full_title = clean_title_noise(full_title)
+        canonical_artist = clean_title_noise(canonical_artist)
+        new_core = _strip_duplicate_artist(
+            f"{full_title} - {canonical_artist}", canonical_artist
+        )
+        return _apply_rename(new_core, "ground-truth")
+
+    # ---- Path B: fuzzy uploader match on hint sides.
+    if " - " in core:
         left, _, right = core.partition(" - ")
-        hint_title = right if canonical_artist.lower() in left.lower() else left
+        candidates = _all_artist_candidates(info)
+        for cand in candidates:
+            c_low = cand.lower()
+            if not c_low or len(c_low) < 3:
+                continue
+            in_left = c_low in left.lower()
+            in_right = c_low in right.lower()
+            if in_left and not in_right:
+                # Artist is on the LEFT → file is in Artist-Title order,
+                # we need to flip. Detach any mis-attached version qualifier
+                # and move it to the title side.
+                artist_clean, version_block = _detach_version_from_artist(left)
+                title_side = right.strip()
+                if version_block and version_block.lower() not in title_side.lower():
+                    title_side = f"{title_side} {version_block}".strip()
+                title_side = clean_title_noise(title_side)
+                artist_clean = clean_title_noise(artist_clean)
+                new_core = _strip_duplicate_artist(
+                    f"{title_side} - {artist_clean}", artist_clean
+                )
+                return _apply_rename(new_core, "uploader-flip")
+            if in_right and not in_left:
+                # Already Title-Artist; nothing to flip. Still worth cleaning
+                # noise if the hint had any.
+                break
 
-    full_title = _preserve_version_qualifier(hint_title, canonical_track)
-    full_title = clean_title_noise(full_title)
-    canonical_artist = clean_title_noise(canonical_artist)
-
-    new_core = f"{full_title} - {canonical_artist}"
-    new_core = _strip_duplicate_artist(new_core, canonical_artist)
-    target = mp3.with_name(f"{prefix}{safe_filename(new_core)}.mp3")
-    if target == mp3:
+    # ---- Path C: just clean noise.
+    cleaned = clean_title_noise(core)
+    if cleaned == core:
         return mp3
-    if target.exists() and target != mp3:
-        return mp3
-    try:
-        mp3.rename(target)
-        log.info("ground-truth rename: %r -> %r", mp3.name, target.name)
-        return target
-    except OSError:
-        return mp3
+    return _apply_rename(cleaned, "noise-clean")
 
 
 def _cleanup_partials(target_mp3: Path) -> None:
