@@ -90,11 +90,18 @@ class TracklistEntry:
     def filename(self) -> str:
         """Preferred on-disk stem: 'Title - Artist' when both are known.
 
+        Strips common YouTube-title noise ('(Official Audio)', '(HD)',
+        bullet symbols, dates in parens, trailing '- Official Audio') so
+        the hint fed to yt-dlp is already clean.
+
         Logs every call so misbehaving installs (old venv, stale process, two
         musicdl packages on sys.path) show up in the bot log immediately.
         """
+        from .downloader import clean_title_noise
         if self.artist and self.title:
-            out = f"{self.title} - {self.artist}"
+            title = clean_title_noise(self.title)
+            artist = clean_title_noise(self.artist)
+            out = f"{title} - {artist}"
             import logging
             logging.getLogger("musicdl.tracklist").info(
                 "FILENAME-ORDER=Title-Artist stem=%r", out

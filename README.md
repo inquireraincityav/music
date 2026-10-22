@@ -389,6 +389,8 @@ musicdl-retag --dir /path           # a different folder
 musicdl-retag --serato-crates       # retag only the files referenced by your Serato crates
 musicdl-retag --serato-crates "Hip Hop,Bangers"
                                     # limit to specific crate names
+musicdl-retag --clean-names         # also rename files to strip '(Official Audio)',
+                                    # dates, bullets, '- Visualiser', duplicate artist suffix
 musicdl-retag --delete-serato       # also clear .serato sidecars so Serato re-analyzes
 musicdl-retag --dry-run             # report-only, no changes
 ```

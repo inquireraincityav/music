@@ -46,6 +46,36 @@ def _ffmpeg_binary() -> str:
     return shutil.which("ffmpeg") or "ffmpeg"
 
 
+def clean_existing_name(mp3: Path, dry_run: bool = False) -> tuple[Path, str]:
+    """Rename a file to strip title noise ('(Official Audio)', dates, bullet
+    symbols, '- Visualiser', etc.). Preserves any 'NN - ' playlist prefix.
+    Returns (new_path_or_original, message).
+    """
+    import re
+    from .downloader import clean_title_noise
+
+    stem = mp3.stem
+    m = re.match(r"^(\d{2,3}\s*[-\.]\s*)(.+)$", stem)
+    prefix = m.group(1) if m else ""
+    core = m.group(2) if m else stem
+    cleaned = clean_title_noise(core)
+    if not cleaned or cleaned == core:
+        return mp3, "no change"
+    new_name = f"{prefix}{cleaned}.mp3"
+    target = mp3.with_name(new_name)
+    if target == mp3:
+        return mp3, "no change"
+    if target.exists():
+        return mp3, "target already exists, skipped"
+    if dry_run:
+        return target, f"would rename -> {new_name}"
+    try:
+        mp3.rename(target)
+        return target, f"renamed -> {new_name}"
+    except OSError as e:
+        return mp3, f"rename failed: {e}"
+
+
 def retag_file(mp3: Path, dry_run: bool = False) -> tuple[bool, str]:
     """Rewrite one MP3's headers. Returns (success, message)."""
     if dry_run:
@@ -298,6 +328,16 @@ def main() -> int:
         help="Also delete .serato analysis sidecar folders so Serato re-analyzes.",
     )
     parser.add_argument(
+        "--clean-names",
+        action="store_true",
+        help=(
+            "Also rename files to strip title noise: '(Official Audio)', "
+            "'(HD)', bullet symbols, dates in parens, '- Visualiser', venue "
+            "names in '(Live at ...)', duplicate artist suffixes. Preserves "
+            "the 'NN - ' playlist prefix."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Only report what would change; don't touch any files.",
@@ -340,6 +380,21 @@ def main() -> int:
         print(f"\nFound {len(mp3s)} unique .mp3 file(s) in the crate(s).")
         if args.dry_run:
             print("DRY RUN — no files will change")
+
+        # Clean names FIRST so retag writes headers to the final file path.
+        if args.clean_names:
+            print("Cleaning filename noise ('(Official Audio)', dates, bullets)…")
+            renamed = 0
+            new_mp3s: list[Path] = []
+            for m in mp3s:
+                new_path, msg = clean_existing_name(m, dry_run=args.dry_run)
+                if new_path != m:
+                    renamed += 1
+                    log.info("rename: %s -> %s", m.name, new_path.name)
+                new_mp3s.append(new_path)
+            print(f"  {renamed} file(s) {'would be ' if args.dry_run else ''}renamed")
+            mp3s = new_mp3s
+
         print("Re-tagging with ID3v2.3 + Xing header (stream copy, no quality loss)...")
         stats = retag_files(mp3s, dry_run=args.dry_run, progress_cb=progress)
         print()
@@ -392,6 +447,19 @@ def main() -> int:
     print(f"Found {len(mp3s)} .mp3 files under {root}")
     if args.dry_run:
         print("DRY RUN — no files will change")
+
+    if args.clean_names:
+        print("Cleaning filename noise ('(Official Audio)', dates, bullets)…")
+        renamed = 0
+        for m in list(mp3s):
+            new_path, _msg = clean_existing_name(m, dry_run=args.dry_run)
+            if new_path != m:
+                renamed += 1
+                log.info("rename: %s -> %s", m.name, new_path.name)
+        print(f"  {renamed} file(s) {'would be ' if args.dry_run else ''}renamed")
+        # Re-scan after rename so retag targets the new paths.
+        mp3s = list(root.rglob("*.mp3"))
+
     print("Re-tagging with ID3v2.3 + Xing header (stream copy, no quality loss)...")
 
     stats = retag_tree(root, dry_run=args.dry_run, progress_cb=progress)

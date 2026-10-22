@@ -240,23 +240,26 @@ def _verify_and_finalize(reported_path: str) -> Path:
 def _preferred_stem_from_info(info: dict) -> Optional[str]:
     """Build a 'Title - Artist' stem from yt-dlp metadata when both parts exist.
 
-    Prefers the track/artist fields that yt-dlp pulls out of music videos'
-    descriptions; falls back to None (caller keeps whatever filename yt-dlp
-    chose) when either side is missing.
+    Uses the strict `track`-only + music-channel-only resolvers so random
+    curator channels don't end up as the "artist". Returns None when
+    metadata is weak — the caller then keeps whatever filename yt-dlp
+    chose (which the hint already shaped) and relies on
+    _enforce_title_artist_order to clean noise.
     """
-    title = (info.get("track") or info.get("title") or "").strip()
-    artist = (
-        info.get("artist")
-        or info.get("creator")
-        or info.get("uploader")
-        or ""
-    ).strip()
-    # Drop channel-style suffixes like " - Topic" that YT Music auto-appends.
-    if artist.endswith(" - Topic"):
-        artist = artist[: -len(" - Topic")].strip()
-    if not title or not artist:
+    track = _resolve_track_from_info(info)
+    artist = _resolve_artist_from_info(info)
+    if not track and info.get("title"):
+        # Last-chance fallback for bare URL downloads with no music metadata:
+        # use the cleaned video title (not an invented artist, so no "- "
+        # suffix). Better than reverting to yt-dlp's raw filename.
+        cleaned = clean_title_noise(info.get("title") or "")
+        return cleaned or None
+    if not track or not artist:
         return None
-    # Don't duplicate the artist if the title already contains it.
+    title = clean_title_noise(track)
+    artist = clean_title_noise(artist)
+    if not title or not artist:
+        return title or None
     if artist.lower() in title.lower():
         return title
     return f"{title} - {artist}"
@@ -285,33 +288,115 @@ def _rename_to_preferred(
 
 
 def _resolve_artist_from_info(info: dict) -> str:
-    """Pull the best available artist name from yt-dlp metadata.
+    """Pull a RELIABLE artist name from yt-dlp metadata.
 
-    Preference, each stripped of trailing " - Topic" / " VEVO" / " - Official":
-      1. `artist` (set by music-aware extractors; sometimes multi-value "A, B")
-      2. `creator`
-      3. `uploader` / `channel`  (channel-name fallback — "<Artist> - Topic"
-         on YouTube Music auto-generated channels is the actual artist name)
+    Only returns something when the signal is unambiguous:
+      1. `artist` from a music-aware extractor (YouTube Music, SoundCloud
+         with proper tags, Spotify-via-spotdl, …).
+      2. `creator`.
+      3. `uploader` / `channel` ONLY when it has a music-channel suffix
+         ('- Topic', 'VEVO', '- Official'); stripped on return. Topic
+         channels are YouTube Music's auto-generated per-artist channels
+         and ARE the artist.
+
+    Returns empty when the only available uploader is a generic curator
+    channel like "Future House Music" or "Remix Land" — using those as the
+    "artist" produced the duplicated-name mess the user flagged.
     """
-    for key in ("artist", "creator", "uploader", "channel"):
+    for key in ("artist", "creator"):
+        val = (info.get(key) or "").strip()
+        if val:
+            for suffix in (" - Topic", " VEVO", "VEVO", " - Official", " Official"):
+                if val.endswith(suffix):
+                    val = val[: -len(suffix)].strip()
+            return val
+    for key in ("uploader", "channel"):
         val = (info.get(key) or "").strip()
         if not val:
             continue
-        for suffix in (" - Topic", " VEVO", "VEVO", " - Official", " Official"):
+        for suffix in (" - Topic", " VEVO", "VEVO"):
             if val.endswith(suffix):
-                val = val[: -len(suffix)].strip()
-        if val:
-            return val
+                return val[: -len(suffix)].strip()
     return ""
 
 
 def _resolve_track_from_info(info: dict) -> str:
-    """Pull the best available song title from yt-dlp metadata."""
-    for key in ("track", "title"):
-        val = (info.get(key) or "").strip()
-        if val:
-            return val
-    return ""
+    """Only returns yt-dlp's `track` field. Falling back to `title` was the
+    bug: raw video titles already contain 'Artist - Title (Official Audio)'
+    chatter, and reusing them as the canonical track produced files like
+    'Calvin Harris, Jazzy - Satisfy (Extended Mix - Official Audio) -
+    Calvin Harris.mp3'. If we don't have a clean track, we don't override."""
+    return (info.get("track") or "").strip()
+
+
+# Whole-paren noise blocks to remove entirely (no useful content inside).
+_WHOLE_NOISE_PATTERNS = [
+    r"\(\s*(?:Official\s+)?(?:Music\s+)?Video\s*\)",
+    r"\(\s*Official\s+(?:Audio|Music\s+Video|Lyric\s+Video|HD\s+Video)\s*\)",
+    r"\[\s*(?:Official\s+)?(?:Music\s+)?Video\s*\]",
+    r"\[\s*Official\s+(?:Audio|Music\s+Video|Lyric\s+Video|HD\s+Video)\s*\]",
+    r"\(\s*(?:HD|HQ|4K|8K|1080p|720p|High\s+Quality|Audio|Lyrics?)\s*\)",
+    r"\[\s*(?:HD|HQ|4K|8K|1080p|720p|High\s+Quality|Audio|Lyrics?)\s*\]",
+    r"\(\s*\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}\s*\)",
+    r"\(\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}\s*\)",
+    r"\(\s*(?:19|20)\d{2}\s*\)",
+    r"\(\s*(?:Lyric\s+Video|Lyrics?|Visualizer|Visualiser)\s*\)",
+    r"\[\s*(?:Lyric\s+Video|Lyrics?|Visualizer|Visualiser)\s*\]",
+    r"\s[-–—]\s*Official\s+(?:Audio|Video|Music\s+Video)\s*$",
+]
+_WHOLE_NOISE_COMPILED = [re.compile(p, re.IGNORECASE) for p in _WHOLE_NOISE_PATTERNS]
+
+# Noise that appears INSIDE a paren block alongside legitimate content (e.g.
+# "(Extended Mix - Official Audio)" → "(Extended Mix)"; "(Live at Hordern,
+# Sydney)" → "(Live)"). The whole paren is kept; only the trailing-noise
+# fragment is removed.
+_INNER_NOISE_PATTERNS = [
+    r"\s*[-–—]\s*Official\s+(?:Audio|Video|Music\s+Video)",
+    r"\s*[-–—]\s*(?:Visualizer|Visualiser|Lyric\s+Video|Lyrics)",
+    # "Live at <venue>, <city>" → "Live"; keeps the version info without the
+    # venue description that Serato has no use for.
+    r"\s+at\s+[^)\]]+",
+    # Trailing performance context like "(acoustic session)" → "(acoustic)".
+    r"\s+session\b",
+]
+_INNER_NOISE_COMPILED = [re.compile(p, re.IGNORECASE) for p in _INNER_NOISE_PATTERNS]
+_TITLE_BULLETS = re.compile(r"[●•·►▶→]+")
+
+
+def _clean_paren_content(text: str) -> str:
+    """Scrub noise from inside each (...) and [...] block without removing
+    the legitimate version qualifier that lives alongside it."""
+    def scrub(m: "re.Match") -> str:
+        open_ch, close_ch = m.group(1), m.group(3)
+        inner = m.group(2)
+        for pat in _INNER_NOISE_COMPILED:
+            inner = pat.sub("", inner)
+        inner = re.sub(r"\s+", " ", inner).strip()
+        if not inner:
+            return ""
+        return f"{open_ch}{inner}{close_ch}"
+    return re.sub(r"([\(\[])([^)\]]*)([\)\]])", scrub, text)
+
+
+def clean_title_noise(text: str) -> str:
+    """Strip 'Official Audio' / dates / HD markers / bullets from a title.
+
+    Two-pass:
+      1. Scrub noise inside paren/bracket blocks (keeps the real version
+         qualifier that often sits alongside the noise).
+      2. Remove whole paren/bracket blocks that are entirely noise.
+    """
+    if not text:
+        return text
+    out = _TITLE_BULLETS.sub(" ", text)
+    out = _clean_paren_content(out)
+    for pat in _WHOLE_NOISE_COMPILED:
+        out = pat.sub("", out)
+    out = re.sub(r"\s+", " ", out).strip()
+    out = re.sub(r"^\s*[-–—:|]\s*", "", out).strip()
+    out = re.sub(r"\s*[-–—:|]\s*$", "", out).strip()
+    out = re.sub(r"\(\s*\)|\[\s*\]", "", out).strip()
+    return out
 
 
 def _preserve_version_qualifier(hint_title: str, canonical_track: str) -> str:
@@ -332,48 +417,82 @@ def _preserve_version_qualifier(hint_title: str, canonical_track: str) -> str:
     return canonical_track
 
 
+def _strip_duplicate_artist(core: str, artist: str) -> str:
+    """If the artist name appears both at the start and the end of the stem,
+    drop the leading occurrence. Produced from a hint of 'Artist - Title'
+    being enforced to 'Title - Artist' when the title also already contained
+    the artist name as a prefix."""
+    if not artist:
+        return core
+    a = artist.lower().strip()
+    low = core.lower()
+    if " - " not in low:
+        return core
+    left, _, right = core.partition(" - ")
+    if left.strip().lower() == a and a in right.lower():
+        return right.strip()
+    return core
+
+
 def _enforce_title_artist_order(
     mp3: Path,
     info: dict,
     playlist_index: Optional[int],
 ) -> Path:
-    """Rebuild the filename as 'Title - Artist' from yt-dlp metadata when
-    metadata is available. Ground-truth wins over whatever ordering the
-    tracklist entry supplied, so the result is airtight regardless of how
-    the uploader wrote the description.
+    """Final filename shaping. Two paths:
 
-    Preserves any version qualifier that was in the original hint title
-    (e.g. "(VIP Mix)", "(Dan Bravo Edit)") but missing from yt-dlp's
-    bare `track` field — Serato needs those to distinguish versions.
+    A. RELIABLE metadata (yt-dlp gave us a real `track` AND a reliable
+       `artist` — either the proper tag or a '- Topic' / VEVO channel) →
+       rebuild as 'cleaned-title - canonical-artist', preserving any
+       (Remix) / (VIP Mix) qualifier from the hint. Ground truth wins.
 
-    No-op when metadata is truly empty — we literally can't tell which
-    side is which; the hint-derived name is the best guess we have.
+    B. WEAK or missing metadata (uploader is a generic curator channel
+       like "Future House Music"; `track` is empty) → DON'T use the
+       channel name as the artist (that produced the duplicated-name
+       mess). Keep the hint's artist/title ordering but strip noise
+       from the title ((Official Audio), dates, bullets, etc.).
     """
     canonical_track = _resolve_track_from_info(info)
     canonical_artist = _resolve_artist_from_info(info)
-    if not canonical_track or not canonical_artist:
-        return mp3
 
     stem = mp3.stem
     m = re.match(r"^(\d{2,3}\s*[-\.]\s*)(.+)$", stem)
     prefix = m.group(1) if m else ""
     core = m.group(2) if m else stem
 
-    # The hint's "title" side is whatever is NOT the canonical artist — try
-    # to find it so we can preserve version qualifiers.
+    # ---- Path B: no reliable metadata, just clean noise in-place.
+    if not canonical_track or not canonical_artist:
+        cleaned = clean_title_noise(core)
+        if cleaned == core:
+            return mp3
+        target = mp3.with_name(f"{prefix}{safe_filename(cleaned)}.mp3")
+        if target == mp3 or target.exists():
+            return mp3
+        try:
+            mp3.rename(target)
+            log.info("cleaned title noise: %r -> %r", mp3.name, target.name)
+            return target
+        except OSError:
+            return mp3
+
+    # ---- Path A: rebuild from canonical metadata.
+    # Find the hint-side that is NOT the artist, so we can carry its version
+    # qualifier through into the final filename.
     hint_title = core
     if " - " in core and canonical_artist.lower() in core.lower():
         left, _, right = core.partition(" - ")
         hint_title = right if canonical_artist.lower() in left.lower() else left
 
     full_title = _preserve_version_qualifier(hint_title, canonical_track)
+    full_title = clean_title_noise(full_title)
+    canonical_artist = clean_title_noise(canonical_artist)
+
     new_core = f"{full_title} - {canonical_artist}"
+    new_core = _strip_duplicate_artist(new_core, canonical_artist)
     target = mp3.with_name(f"{prefix}{safe_filename(new_core)}.mp3")
     if target == mp3:
         return mp3
     if target.exists() and target != mp3:
-        # Another download already produced this exact file — leave current
-        # one and move on (dedup is handled elsewhere).
         return mp3
     try:
         mp3.rename(target)
